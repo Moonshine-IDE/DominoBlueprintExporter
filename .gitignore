@@ -1,0 +1,25 @@
+# Gradle
+.gradle/
+build/
+
+# Local configuration – never commit credentials
+gradle.properties
+
+# IDE files
+.eclipse/
+.idea/
+*.iml
+*.classpath
+*.project
+.settings/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Runtime export output (not part of the source distribution)
+export/
+
+# Domino Notes shared memory / lock files and runtime config created at runtime
+*.nbf
+notes.ini

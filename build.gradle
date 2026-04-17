@@ -1,0 +1,190 @@
+plugins {
+    id 'java'
+    id 'application'  // enables the 'run' task and distribution packaging
+    id 'eclipse'      // allows dependencies to be exported to .classpath
+    id 'com.github.johnrengelman.shadow' version '7.1.2'  // fat JAR – bundles Domino JARs
+}
+
+archivesBaseName = 'DominoBlueprintExporter'
+mainClassName = 'net.prominic.dominoblueprint.DominoBlueprintExporter'
+
+repositories {
+    mavenCentral()
+}
+
+sourceSets {
+    main {
+        java {
+            srcDirs = ['src/main/java']
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Notes / Domino installation discovery
+// ---------------------------------------------------------------------------
+
+String notesInstallation = project.findProperty('notesInstallation') ?: '/Applications/HCL Notes.app/Contents/MacOS/'
+if (!notesInstallation) {
+    throw new GradleException("Missing configured path for Notes installation.  Set notesInstallation in gradle.properties.")
+} else if (!(new File(notesInstallation).exists())) {
+    throw new GradleException("Invalid configured path for Notes installation ($notesInstallation).  Check notesInstallation in gradle.properties.")
+}
+
+String notesJarBaseDir = notesInstallation
+String envPath = System.getenv('PATH') ?: ''
+
+// macOS puts extra JARs one level up from the MacOS directory
+if (notesInstallation.toLowerCase().startsWith('/applications/')) {
+    notesJarBaseDir = "$notesInstallation/.."
+} else { // Windows / Linux
+    envPath = "$envPath;$notesInstallation"
+    println "Updated PATH: $envPath"
+}
+
+/**
+ * Recursively find a file under baseDir. If multiple copies exist, the last
+ * one found wins (consistent with the behaviour in DXLImporter-Gradle-Demo).
+ */
+String findFile(String baseDir, String findName) {
+    String foundFile = null
+    new File(baseDir).eachFileRecurse { File curFile ->
+        if (curFile.getName() == findName) {
+            foundFile = curFile.getAbsolutePath()
+            println "Found file '$findName' at '${curFile.getAbsolutePath()}'"
+        }
+    }
+    if (!foundFile) {
+        println("Could not find '$findName' in '$baseDir'")
+    }
+    return foundFile
+}
+
+String notesJarPath = findFile(notesJarBaseDir, 'Notes.jar')
+// Required: web-service support classes used by DxlExporter at runtime
+// (lotus.domino.websvc.*, lotus.domino.axis.*, lotus.domino.ws.*)
+// DXLImporter-Gradle-Demo uses this same JAR for the same reason.
+String webSvcJarPath = findFile(notesJarBaseDir, 'websvc.jar')
+// Domino 12.0.2+ NAPI JARs (optional – present in newer installs)
+String napiJarPath  = findFile(notesJarBaseDir, 'lwpd.domino.napi.jar')
+String lwpdJarPath  = findFile(notesJarBaseDir, 'lwpd.commons.jar')
+
+// ---------------------------------------------------------------------------
+// Java compatibility
+// ---------------------------------------------------------------------------
+
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+
+// ---------------------------------------------------------------------------
+// Dependencies
+// ---------------------------------------------------------------------------
+
+dependencies {
+    implementation files("$notesJarPath")
+    // websvc.jar must be bundled: DxlExporter.NexportDxl() (native method) tries
+    // to load lotus.domino.websvc.*, lotus.domino.axis.*, and lotus.domino.ws.*
+    // classes at runtime whenever it encounters agents or script libraries.
+    // Without it the export throws NoClassDefFoundError and aborts mid-collection.
+    if (webSvcJarPath) implementation files("$webSvcJarPath")
+    if (napiJarPath)   implementation files("$napiJarPath")
+    if (lwpdJarPath)   implementation files("$lwpdJarPath")
+}
+
+// ---------------------------------------------------------------------------
+// Fat JAR – produced by the Shadow plugin
+//
+// Bundles Notes.jar and the other Domino JARs directly into DXLExporter.jar
+// so the JAR is self-contained at the Java level.  The Domino *native*
+// libraries (.so / .dylib / .dll) still need to be accessible at runtime via
+// LD_LIBRARY_PATH / DYLD_LIBRARY_PATH – use run.sh which handles this
+// automatically, or set the variable yourself before calling java -jar.
+//
+// Build:  gradle shadowJar   (or simply: gradle build)
+// Run:    java -jar build/libs/DominoBlueprintExporter.jar <server> <database> [outputDir]
+// ---------------------------------------------------------------------------
+
+// Disable the thin jar – we only want the fat jar
+jar.enabled = false
+
+shadowJar {
+    archiveFileName = 'DominoBlueprintExporter.jar'   // keep the same name regardless of version
+
+    manifest {
+        attributes 'Main-Class': mainClassName
+        // No Class-Path needed – everything is bundled inside
+    }
+
+    mergeServiceFiles()   // handle duplicate META-INF/services across bundled JARs
+}
+
+// 'gradle build' and 'gradle assemble' both produce the fat jar
+assemble.dependsOn shadowJar
+
+// ---------------------------------------------------------------------------
+// runExporter – convenience Gradle task for development / CI
+//
+// All argument validation and assembly is deferred to doFirst{} so that
+// other tasks (e.g. 'jar', 'clean') are never affected by missing -P flags.
+//
+// Usage:
+//   gradle -PnotesInstallation=<path> \
+//          -PnotesIDPassword=<password> \
+//          -Pserver=<server> \
+//          -PdbName=<database.nsf> \
+//          [-PoutputDir=./export] \
+//          runExporter
+//
+// Produces: build/libs/DominoBlueprintExporter.jar
+// ---------------------------------------------------------------------------
+
+task runExporter(type: JavaExec, dependsOn: classes) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = mainClassName
+
+    // Domino native library path (macOS: DYLD_LIBRARY_PATH; Linux: LD_LIBRARY_PATH)
+    environment('DYLD_LIBRARY_PATH', notesInstallation)
+    environment('LD_LIBRARY_PATH',   notesInstallation)
+    environment('PATH', envPath)
+
+    // Redirect stderr to stdout for clearer output in CI logs
+    errorOutput = System.out
+
+    // -----------------------------------------------------------------------
+    // Everything below runs only when this specific task is executed,
+    // NOT during configuration of the whole build.
+    // -----------------------------------------------------------------------
+    doFirst {
+        String server      = project.findProperty('server')    ?: ''
+        String dbName      = project.findProperty('dbName')    ?: ''
+        String outputDir   = project.findProperty('outputDir') ?: './export'
+
+        // Accept the password from -PnotesIDPassword=<pw> OR from the PASSWORD
+        // environment variable already set in the shell.  Interactive prompting
+        // is not possible in Gradle (no real TTY), so one of these two must be set.
+        String notesIDPassword = project.findProperty('notesIDPassword')
+                              ?: System.getenv('PASSWORD')
+                              ?: ''
+
+        if (!dbName) {
+            throw new GradleException(
+                "Database name is required.  Add -PdbName=<database.nsf> to your Gradle command.")
+        }
+
+        if (notesIDPassword) {
+            // 1. Expose via PASSWORD env var so our Java code picks it up silently
+            //    (avoids the "shell history" warning that the --password flag triggers).
+            environment('PASSWORD', notesIDPassword)
+            // 2. Also feed via stdin for Domino's *native* password reader, which
+            //    reads directly from the process stdin stream before our Java code runs.
+            standardInput = new java.io.StringBufferInputStream("${notesIDPassword}\n\u001B")
+        } else {
+            // No password supplied – send Esc to dismiss any unexpected native prompt.
+            standardInput = new java.io.StringBufferInputStream("\u001B")
+        }
+
+        args '--server', server, '--database', dbName, '--output', outputDir
+        // Note: we deliberately do NOT pass --password here; the PASSWORD env var
+        // set above is sufficient and avoids printing a shell-history warning.
+    }
+}

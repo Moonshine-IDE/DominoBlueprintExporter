@@ -1,0 +1,24 @@
+# gradle.properties.example
+# Copy this file to gradle.properties and fill in the values for your environment.
+# gradle.properties is listed in .gitignore so credentials stay off of version control.
+
+# ---------------------------------------------------------------------------
+# Required: path to your HCL Notes / Domino installation
+# ---------------------------------------------------------------------------
+# macOS
+#notesInstallation=/Applications/HCL Notes.app/Contents/MacOS/
+
+# Windows (example)
+#notesInstallation=C:/Program Files/HCL/Notes/
+
+# Domino server (Linux)
+#notesInstallation=/opt/hcl/domino/notes/latest/linux/
+
+notesInstallation=/Applications/HCL Notes.app/Contents/MacOS/
+
+# ---------------------------------------------------------------------------
+# Export target (override on the command line with -P flags instead of here)
+# ---------------------------------------------------------------------------
+# server=myserver/Org
+# dbName=apps/mydb.nsf
+# outputDir=./export
