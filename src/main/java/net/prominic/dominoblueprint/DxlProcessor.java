@@ -41,9 +41,15 @@ import java.util.Set;
  *             of each design element</li>
  *       </ul>
  *   </li>
- *   <li><b>Detect Java</b> – an element is flagged as Java code when it contains a
- *       {@code <javaproject>} child, allowing the caller to skip it when exporting
- *       the {@code code/} category.</li>
+ *   <li><b>Detect Java</b> – an element is flagged as Java code when its own tag
+ *       name matches a Java-only tag (e.g. {@code <javaresource>}) or when any
+ *       descendant is a {@code <javaproject>} element, allowing the caller to skip
+ *       it when exporting the {@code code/} or {@code resources/} categories.</li>
+ *   <li><b>Detect excluded noise</b> – flags elements that are not true design but
+ *       still surface in the export: per-user private replication formulas (named
+ *       after the user, e.g. {@code CN=Jane Doe/O=Acme}) and XPages build artifacts
+ *       (file resources under {@code WEB-INF/}, Eclipse dotfiles, {@code plugin.xml},
+ *       {@code build.properties}).</li>
  * </ol>
  *
  * <p>The output matches the format used by the manually-exported example files
@@ -62,9 +68,20 @@ public class DxlProcessor {
             "increasemaxfields", "compressdesign", "compressdata", "uselz1"
     ));
 
-    /** Top-level children of {@code <database>} that should not appear in per-element exports. */
+    /**
+     * Top-level children of {@code <database>} that are never treated as design
+     * elements and are dropped entirely from the split output.
+     *
+     * <ul>
+     *   <li>{@code <databaseinfo>} – source-database metadata (replica id, path, …).</li>
+     *   <li>{@code <agentdata>} – agent run-history notes. Domino stores one per
+     *       agent with {@code $Signature}, last-run info, and other runtime state.
+     *       Not part of the design; re-created automatically when agents run.</li>
+     * </ul>
+     */
     private static final Set<String> DATABASE_CHILDREN_TO_REMOVE = new HashSet<>(Arrays.asList(
-            "databaseinfo"
+            "databaseinfo",
+            "agentdata"
     ));
 
     /**
@@ -76,28 +93,67 @@ public class DxlProcessor {
     ));
 
     /**
-     * If a design element contains a child element with one of these names it is
-     * a Java design element and should be excluded from the {@code code/} export.
+     * If a design element contains a <b>descendant</b> element with one of these names it
+     * is a Java design element and should be excluded when {@code skipJava} is enabled.
      */
-    private static final Set<String> JAVA_ELEMENT_NAMES = new HashSet<>(Arrays.asList(
+    private static final Set<String> JAVA_DESCENDANT_NAMES = new HashSet<>(Arrays.asList(
             "javaproject"
     ));
 
     /**
-     * Human-readable file-name suffixes keyed by the DXL element tag name.
-     * Anything not listed here falls back to a capitalised version of the tag name.
+     * If a design element's <b>own</b> tag name matches one of these, it is a Java
+     * design element (e.g. a Java Resource holding compiled .class files) and should
+     * be excluded when {@code skipJava} is enabled.
+     */
+    private static final Set<String> JAVA_ELEMENT_TAGS = new HashSet<>(Arrays.asList(
+            "javaresource"
+    ));
+
+    /**
+     * Human-readable file-name suffixes keyed by the DXL element tag name
+     * (or, for generic {@code <note class="X">} wrappers, by the {@code class}
+     * attribute value — see {@link #resolveType(Element)}).
+     *
+     * <p>Anything not listed here falls back to a capitalised version of the key.
      */
     private static final java.util.Map<String, String> TYPE_SUFFIXES =
             new java.util.LinkedHashMap<String, String>() {{
-                put("form",          "Form");
-                put("subform",       "Subform");
-                put("sharedfield",   "SharedField");
-                put("view",          "View");
-                put("folder",        "Folder");
-                put("sharedcolumn",  "SharedColumn");
-                put("agent",         "Agent");
-                put("scriptlibrary", "ScriptLibrary");
-                put("sharedactions", "SharedActions");
+                // Forms category
+                put("form",                   "Form");
+                put("subform",                "Subform");
+                put("sharedfield",            "SharedField");
+                // Views category
+                put("view",                   "View");
+                put("folder",                 "Folder");
+                put("sharedcolumn",           "SharedColumn");
+                // Code category
+                put("agent",                  "Agent");
+                put("scriptlibrary",          "ScriptLibrary");
+                put("sharedactions",          "SharedActions");
+                // Resources category
+                put("imageresource",          "Image");
+                put("stylesheetresource",     "Stylesheet");
+                put("fileresource",           "FileResource");
+                put("javaresource",           "JavaResource");
+                // Pages category
+                put("page",                   "Page");
+                put("frameset",               "Frameset");
+                put("outline",                "Outline");
+                put("navigator",              "Navigator");
+                // Other category
+                put("databasescript",         "DatabaseScript");
+                put("dbicon",                 "DatabaseIcon");
+                put("helpaboutdocument",      "HelpAbout");
+                put("helpusingdocument",      "HelpUsing");
+                put("aboutdocument",          "HelpAbout");     // older DXL variant
+                put("usingdocument",          "HelpUsing");     // older DXL variant
+                put("dataconnectionresource", "DataConnection");
+                put("replicationformula",     "ReplicationFormula");
+                put("databaseprofile",        "Profile");
+                // Generic <note class="X"> values that DxlExporter uses instead of
+                // dedicated tags for certain element kinds
+                put("icon",                   "DatabaseIcon");
+                put("help",                   "HelpIndex");
             }};
 
     /** The DOCTYPE system identifier used in exported DXL files. */
@@ -140,12 +196,13 @@ public class DxlProcessor {
         List<DesignElement> result   = new ArrayList<>(designElements.size());
 
         for (Element el : designElements) {
-            String  type    = localName(el);
-            String  name    = elementName(el);
-            boolean isJava  = containsJavaProject(el);
+            String  type     = resolveType(el);
+            String  name     = resolveName(el);
+            boolean isJava   = isJavaElement(el);
+            String  excluded = resolveExclusion(type, name);
             String  cleanDxl = buildCleanDxl(database, el);
 
-            result.add(new DesignElement(type, name, isJava, cleanDxl));
+            result.add(new DesignElement(type, name, isJava, excluded, cleanDxl));
         }
 
         return result;
@@ -254,11 +311,25 @@ public class DxlProcessor {
     }
 
     /**
-     * Return {@code true} if the element or any of its descendants is a
-     * {@code <javaproject>} element (indicating this note contains Java code).
+     * Return {@code true} if the element itself, or any of its descendants, is a
+     * Java design element.
+     *
+     * <p>Two flavours are detected:
+     * <ul>
+     *   <li>The element's own tag name matches {@link #JAVA_ELEMENT_TAGS}
+     *       &mdash; e.g. a {@code <javaresource>} containing compiled {@code .class}
+     *       files.</li>
+     *   <li>A descendant with a tag name in {@link #JAVA_DESCENDANT_NAMES} exists
+     *       &mdash; e.g. a {@code <javaproject>} child inside an {@code <agent>}
+     *       or {@code <scriptlibrary>}.</li>
+     * </ul>
      */
-    private static boolean containsJavaProject(Element el) {
-        for (String javaTag : JAVA_ELEMENT_NAMES) {
+    private static boolean isJavaElement(Element el) {
+        // Check the element's own tag name first
+        if (JAVA_ELEMENT_TAGS.contains(localName(el))) return true;
+
+        // Then scan descendants
+        for (String javaTag : JAVA_DESCENDANT_NAMES) {
             // Check with namespace wildcard first, then without
             if (el.getElementsByTagNameNS("*", javaTag).getLength() > 0) return true;
             if (el.getElementsByTagName(javaTag).getLength() > 0) return true;
@@ -309,14 +380,181 @@ public class DxlProcessor {
     }
 
     /**
-     * Return the human-readable name of a design element.
-     * Prefers the {@code name} attribute; falls back to {@code title}; then {@code "unknown"}.
+     * Return the type key to use for {@link DesignElement#getType()} and
+     * {@link TYPE_SUFFIXES} lookup.
+     *
+     * <p>Normally this is just the element's tag name ({@code form}, {@code view},
+     * {@code agent}, …). For the generic {@code <note class="X">} wrapper that
+     * {@code DxlExporter} emits for certain element kinds (database icon,
+     * replication formulas, hidden file resources, …), the {@code class}
+     * attribute is a much better key than the literal tag name "note".
+     *
+     * <p>Special case: {@code <note class="form">} with a {@code $FileData} item
+     * is an XPages-style file resource (NOTE_CLASS_FORM + design flag {@code g}).
+     * Return {@code "fileresource"} so it is named and binned correctly.
      */
-    private static String elementName(Element el) {
+    private static String resolveType(Element el) {
+        String tag = localName(el);
+        if (!"note".equals(tag)) return tag;
+
+        String cls = el.getAttribute("class");
+        if (cls == null || cls.isEmpty()) return tag;
+
+        // File resources stored as NOTE_CLASS_FORM advertise themselves via $FileData.
+        if ("form".equals(cls) && hasItemNamed(el, "$FileData")) {
+            return "fileresource";
+        }
+        return cls;
+    }
+
+    /**
+     * Return the human-readable name of a design element for use as a filename
+     * base. Tries, in order:
+     * <ol>
+     *   <li>The {@code name} attribute on the element itself.</li>
+     *   <li>The {@code title} attribute on the element itself.</li>
+     *   <li>The text content of the {@code $FileNames} item
+     *       (file resources carry their original file path here).</li>
+     *   <li>The text content of the {@code $TITLE} item
+     *       (database icon, replication formulas, help docs, …).</li>
+     *   <li>{@code "unknown"} as a last resort.</li>
+     * </ol>
+     */
+    private static String resolveName(Element el) {
         String name = el.getAttribute("name");
         if (name == null || name.isEmpty()) name = el.getAttribute("title");
-        if (name == null || name.isEmpty()) name = "unknown";
-        return name;
+        if (name != null && !name.isEmpty()) return name;
+
+        String itemText = itemText(el, "$FileNames");
+        if (itemText != null && !itemText.isEmpty()) return itemText;
+
+        itemText = itemText(el, "$TITLE");
+        if (itemText != null && !itemText.isEmpty()) return itemText;
+
+        return "unknown";
+    }
+
+    /**
+     * Return the text content of the first {@code <item name="itemName">} child
+     * of {@code el}, or {@code null} if no such item exists or it has no text.
+     *
+     * <p>Matches the common Domino DXL item shape:
+     * {@code <item name="$TITLE"><text>hello</text></item>}.
+     */
+    private static String itemText(Element el, String itemName) {
+        NodeList children = el.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node n = children.item(i);
+            if (n.getNodeType() != Node.ELEMENT_NODE) continue;
+            Element child = (Element) n;
+            if (!"item".equals(localName(child))) continue;
+            if (!itemName.equals(child.getAttribute("name"))) continue;
+
+            // Prefer the nested <text> child
+            NodeList grand = child.getChildNodes();
+            for (int j = 0; j < grand.getLength(); j++) {
+                Node g = grand.item(j);
+                if (g.getNodeType() == Node.ELEMENT_NODE
+                        && "text".equals(localName((Element) g))) {
+                    String t = g.getTextContent();
+                    if (t != null && !t.isEmpty()) return t;
+                }
+            }
+            // Fall back to the item's full text content
+            String t = child.getTextContent();
+            if (t != null && !t.trim().isEmpty()) return t.trim();
+        }
+        return null;
+    }
+
+    /**
+     * Return a human-readable reason why this element should be excluded from the
+     * design export, or {@code null} if it is a legitimate design element.
+     *
+     * <p>Current exclusions:
+     * <ul>
+     *   <li><b>Private replication formulas</b> &mdash; Domino stores one
+     *       {@code <replicationformula>} per user who has opened the database
+     *       with a local replica (to record their selective-replication rules).
+     *       They are named after the user's canonical name
+     *       ({@code CN=Jane Doe/OU=Dept/O=Acme}) and are per-user state, not design.
+     *       The database-wide replication formula, if present, is kept.</li>
+     *   <li><b>XPages build artifacts</b> &mdash; file resources auto-generated
+     *       by the XPages compiler: everything under {@code WEB-INF/}, all hidden
+     *       Eclipse dotfiles ({@code .classpath}, {@code .project},
+     *       {@code .settings/*}), and OSGi/PDE build descriptors
+     *       ({@code plugin.xml}, {@code build.properties}, {@code feature.xml},
+     *       {@code MANIFEST.MF}). These are regenerated on the target side when
+     *       XPages are rebuilt and would not round-trip cleanly anyway.</li>
+     * </ul>
+     */
+    private static String resolveExclusion(String type, String name) {
+        if (type == null) return null;
+
+        // Private (per-user) replication formula — named after the user's
+        // canonical hierarchical name. The DB-wide one is named "$formula"
+        // or similar and does not start with "CN=".
+        if ("replicationformula".equals(type)
+                && name != null
+                && name.startsWith("CN=")) {
+            return "private replication formula";
+        }
+
+        // XPages build artifacts surface as file resources with well-known paths.
+        if ("fileresource".equals(type)
+                && name != null
+                && isXPagesBuildArtifact(name)) {
+            return "XPages build artifact";
+        }
+
+        return null;
+    }
+
+    /**
+     * Return {@code true} when {@code path} matches a known XPages build artifact:
+     * anything under {@code WEB-INF/}, any hidden dotfile (Eclipse {@code .classpath},
+     * {@code .project}, {@code .settings/}), or a top-level PDE/OSGi build descriptor
+     * ({@code plugin.xml}, {@code build.properties}, {@code feature.xml},
+     * {@code MANIFEST.MF}).
+     */
+    private static boolean isXPagesBuildArtifact(String path) {
+        if (path == null || path.isEmpty()) return false;
+
+        // Normalise any alias separator the caller might have left in place
+        int pipe = path.indexOf('|');
+        if (pipe > 0) path = path.substring(0, pipe);
+
+        // Directory prefixes — WEB-INF on all platforms
+        if (path.startsWith("WEB-INF/") || path.startsWith("WEB-INF\\")) return true;
+
+        // Hidden files — Eclipse/PDE metadata (.classpath, .project, .settings/*, …)
+        if (path.startsWith(".")) return true;
+
+        // Top-level PDE / OSGi build descriptors
+        switch (path) {
+            case "plugin.xml":
+            case "build.properties":
+            case "feature.xml":
+            case "MANIFEST.MF":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** Return {@code true} if {@code el} has an {@code <item name="itemName">} child. */
+    private static boolean hasItemNamed(Element el, String itemName) {
+        NodeList children = el.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node n = children.item(i);
+            if (n.getNodeType() != Node.ELEMENT_NODE) continue;
+            Element child = (Element) n;
+            if ("item".equals(localName(child))
+                    && itemName.equals(child.getAttribute("name"))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // -----------------------------------------------------------------------
@@ -331,13 +569,16 @@ public class DxlProcessor {
         private final String  type;
         private final String  name;
         private final boolean java;
+        private final String  excludedReason;
         private final String  cleanDxl;
 
-        DesignElement(String type, String name, boolean java, String cleanDxl) {
-            this.type     = type;
-            this.name     = name;
-            this.java     = java;
-            this.cleanDxl = cleanDxl;
+        DesignElement(String type, String name, boolean java,
+                      String excludedReason, String cleanDxl) {
+            this.type           = type;
+            this.name           = name;
+            this.java           = java;
+            this.excludedReason = excludedReason;
+            this.cleanDxl       = cleanDxl;
         }
 
         /** DXL element tag name, e.g. {@code "form"}, {@code "agent"}, {@code "view"}. */
@@ -354,6 +595,19 @@ public class DxlProcessor {
          * meaning it is a Java agent or Java script library.
          */
         public boolean isJava() { return java; }
+
+        /**
+         * {@code true} when this element has been flagged for exclusion from the
+         * design export — e.g. a per-user private replication formula or an
+         * XPages build artifact. Callers should skip writing it to disk.
+         */
+        public boolean isExcluded() { return excludedReason != null; }
+
+        /**
+         * Human-readable reason this element is excluded, for log output. Returns
+         * {@code null} when {@link #isExcluded()} is {@code false}.
+         */
+        public String getExcludedReason() { return excludedReason; }
 
         /** Cleaned DXL XML string ready to write to a {@code .dxl} file. */
         public String getCleanDxl() { return cleanDxl; }

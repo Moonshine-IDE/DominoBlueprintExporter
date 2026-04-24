@@ -12,14 +12,20 @@ import java.util.Arrays;
  * DominoBlueprint Exporter – Command-line application for exporting HCL Domino design elements.
  *
  * <p>Connects to a Domino database and exports its design elements as individual
- * DXL files organised into three category directories:
+ * DXL files organised into six category directories:
  *
  * <pre>
  *   &lt;outputDir&gt;/
- *     forms/   – Forms, subforms, shared fields
- *     views/   – Views, folders, shared columns
- *     code/    – Agents, Script Libraries, shared actions  (Java code excluded)
+ *     forms/      – Forms, subforms, shared fields
+ *     views/      – Views, folders, shared columns
+ *     code/       – Agents, Script Libraries, shared actions  (Java code excluded)
+ *     resources/  – Image, stylesheet, and file resources     (Java resources excluded)
+ *     pages/      – Pages, framesets, outlines, navigators
+ *     other/      – Database script/icon, Help About/Using, data connections,
+ *                   replication formulas, profile documents, misc design notes
  * </pre>
+ *
+ * <p>The ACL is not exported here; it is handled by a separate tool.
  *
  * <p>Each exported file is cleaned for re-import: database-specific attributes
  * (replicaid, path, title, etc.) and note metadata (noteinfo, updatedby,
@@ -316,8 +322,14 @@ public class DominoBlueprintExporter {
         System.out.println("  java -jar DominoBlueprintExporter.jar \"\" local.nsf ./export");
         System.out.println();
         System.out.println("Output structure:");
-        System.out.println("  <outputDir>/forms/  – Forms, subforms, shared fields");
-        System.out.println("  <outputDir>/views/  – Views, folders, shared columns");
-        System.out.println("  <outputDir>/code/   – Agents, Script Libraries, shared actions (non-Java)");
+        System.out.println("  <outputDir>/forms/      – Forms, subforms, shared fields");
+        System.out.println("  <outputDir>/views/      – Views, folders, shared columns");
+        System.out.println("  <outputDir>/code/       – Agents, Script Libraries, shared actions (non-Java)");
+        System.out.println("  <outputDir>/resources/  – Image, stylesheet, and file resources (non-Java)");
+        System.out.println("  <outputDir>/pages/      – Pages, framesets, outlines, navigators");
+        System.out.println("  <outputDir>/other/      – Database script/icon, Help docs, data connections,");
+        System.out.println("                            replication formulas, profile docs, misc design");
+        System.out.println();
+        System.out.println("Note: ACL is not exported by this tool.");
     }
 }

@@ -8,11 +8,26 @@ from an existing database so they can be imported into a fresh copy with
 
 ```
 <outputDir>/
-  forms/   – one .dxl file per form, subform, and shared field
-  views/   – one .dxl file per view, folder, and shared column
-  code/    – one .dxl file per agent and Script Library
-             (Java agents and Java Script Libraries are excluded)
+  forms/              – one .dxl file per form
+  views/              – one .dxl file per view and folder
+  shared/             – reusable design elements forms and views reference
+    subforms/         – one .dxl file per subform
+    fields/           – one .dxl file per shared field
+    columns/          – one .dxl file per shared column
+  code/               – agents, Script Libraries, shared actions
+                        (Java agents and Java Script Libraries are excluded)
+  resources/          – image, stylesheet, and file resources
+                        (Java resources and XPages build artifacts are excluded)
+  pages/              – pages, framesets, outlines, navigators
+  other/              – database script, database icon, Help About / Help Using,
+                        data connections, replication formulas, profile documents,
+                        and anything else classified as misc design
 ```
+
+Together these directories represent the full database **design** &mdash;
+importing every file back into an empty database with `DXLImport.jar`
+reproduces the original design. The ACL is **not** exported here and is
+handled by a separate tool.
 
 Each file is cleaned before being written:
 - Database-replica attributes (`replicaid`, `path`, `title`, etc.) are removed
@@ -25,6 +40,13 @@ project and can be imported directly with:
 ```bash
 java -jar DXLImport.jar <server> <database> <file.dxl>
 ```
+
+### Anything Java is excluded
+
+Java agents, Java Script Libraries, and Java Resources all contain compiled
+bytecode that does not round-trip reliably through `DxlImporter`. They are
+detected and skipped in both `code/` and `resources/`. Compile and import
+Java code separately using the Gradle build in `DXLImporter-Gradle-Demo/`.
 
 ## Building
 
@@ -133,7 +155,9 @@ java -cp /local/notesjava/DominoBlueprintExporter.jar:$DOMINO/Notes.jar \
 
 ## GitHub Actions integration
 
-Add an export step before your `Import` steps:
+Add an export step before your `Import` steps. Because `DXLImport.jar` accepts
+a directory and walks it recursively, you can import the entire export tree in
+one invocation:
 
 ```yaml
 - name: Export design elements
@@ -142,34 +166,99 @@ Add an export step before your `Import` steps:
         -jar /local/notesjava/DominoBlueprintExporter.jar \
         $SERVER $SOURCE_DATABASE ./export 2>&1
 
-- name: Import forms
+- name: Import the full design
   run: |
-    for f in ./export/forms/*.dxl; do
-      PASSWORD=password java -jar /local/notesjava/DXLImport.jar \
-          $SERVER $TARGET_DATABASE "$f" 2>&1
-    done
+    PASSWORD=password java -jar /local/notesjava/DXLImport.jar \
+        $SERVER $TARGET_DATABASE ./export 2>&1
+```
 
-- name: Import views
-  run: |
-    for f in ./export/views/*.dxl; do
-      PASSWORD=password java -jar /local/notesjava/DXLImport.jar \
-          $SERVER $TARGET_DATABASE "$f" 2>&1
-    done
+If you prefer per-category control, import each directory in order &mdash; forms
+first so views/code/resources/pages can reference them:
 
-- name: Import code
+```yaml
+- name: Import design by category
   run: |
-    for f in ./export/code/*.dxl; do
-      PASSWORD=password java -jar /local/notesjava/DXLImport.jar \
-          $SERVER $TARGET_DATABASE "$f" 2>&1
+    for dir in forms views code resources pages other; do
+      for f in ./export/$dir/*.dxl; do
+        [ -f "$f" ] || continue
+        PASSWORD=password java -jar /local/notesjava/DXLImport.jar \
+            $SERVER $TARGET_DATABASE "$f" 2>&1
+      done
     done
 ```
 
 ## Design note: excluded Java code
 
-Java agents and Java Script Libraries contain a `<javaproject>` element in
-their DXL.  The exporter detects this and writes them to `code/` only if they
-are *not* Java.  Pure Java code should be compiled and imported separately
-using the Gradle build in `DXLImporter-Gradle-Demo/`.
+Java agents and Java Script Libraries contain a `<javaproject>` descendant in
+their DXL. Java Resources export as `<javaresource>` elements holding
+compiled `.class` data. In all three cases the exporter detects them and
+skips them &mdash; Java code is imported separately using the Gradle build in
+`DXLImporter-Gradle-Demo/`.
+
+## Design note: excluded agent run-history
+
+Every agent in a Domino database has an associated `<agentdata>` note that
+stores the agent's last-run information, `$Signature`, and other runtime
+state. These are not design &mdash; they are re-created automatically when
+agents run in the target database &mdash; so the exporter filters them out.
+A database with 200 agents would otherwise produce 200 `Agentdata_*.dxl`
+files with no value.
+
+## Design note: generic `<note class="…">` wrappers
+
+For some design kinds (database icon, replication formulas, hidden file
+resources used by XPages, …) `DxlExporter` emits a generic
+`<note class="icon">` or `<note class="form">` wrapper rather than a
+dedicated tag like `<dbicon>` or `<fileresource>`. The exporter reads the
+`class` attribute to pick the right type suffix and falls back to the
+`$FileNames` or `$TITLE` item for the filename, so these land with
+descriptive names instead of `Note_2.dxl`, `Note_3.dxl`, etc.
+
+## Design note: excluded private replication formulas
+
+Domino stores one `<replicationformula>` note per user who has opened the
+database with a local replica — these record each user's selective-replication
+rules and are named after the user's canonical hierarchical name
+(`CN=Jane Doe/OU=Dept/O=Acme`). Because they are per-user state, not shared
+design, the exporter skips any replication formula whose name begins with
+`CN=`. A database-wide replication formula (not named after a user) is kept.
+
+## Design note: excluded XPages build artifacts
+
+When a database contains XPages, Designer compiles them into an OSGi plugin
+project and persists the build output as hidden file resources inside the
+NSF. These regenerate on every rebuild and do not need to round-trip. The
+exporter filters out any `<fileresource>` whose `$FileNames` path matches:
+
+- anything under `WEB-INF/` (including `xsp.properties`, `faces-config.xml`,
+  compiled `.class` files, generated Java sources)
+- any hidden dotfile (`.classpath`, `.project`, `.settings/*`, …)
+- the OSGi/PDE descriptors `plugin.xml`, `build.properties`, `feature.xml`,
+  and `MANIFEST.MF`
+
+A compiled `Activator.class` landing at `WEB-INF/classes/plugin/Activator.class`
+slips past the `<javaresource>` filter because it's packaged as a plain file
+resource, not a Java resource — the path-based filter catches it.
+
+## Design note: shared design elements
+
+Subforms, shared fields, and shared columns are design elements that multiple
+forms and views can reference. Rather than burying them inside `forms/` and
+`views/`, they are grouped under `shared/` in dedicated subdirectories
+(`shared/subforms/`, `shared/fields/`, `shared/columns/`). This keeps the
+top-level `forms/` and `views/` directories focused on the first-class design
+containers and makes the shared-element counts easier to see at a glance.
+Because `NoteCollection` exposes no `setSelectSharedColumns()`, shared columns
+are collected alongside views (they share `NOTE_CLASS_VIEW`) and then routed
+to `shared/columns/` based on the `<sharedcolumn>` tag emitted by
+`DxlExporter`.
+
+## Design note: ACL
+
+The ACL is a DXL-exportable design note (via
+`NoteCollection.setSelectACL(true)` or the `<acl>` element in a full-database
+export) but it is intentionally left out of this tool. ACL import/export is
+handled by a separate utility.
 
 ## Project structure
 
@@ -181,7 +270,8 @@ DominoBlueprintExporter/
 ├── LICENSE.md                      Server Side Public License v1
 ├── src/main/java/net/prominic/dominoblueprint/
 │   ├── DominoBlueprintExporter.java  CLI entry point & argument parsing
-│   ├── DesignExporter.java           Export orchestrator (forms / views / code)
+│   ├── DesignExporter.java           Export orchestrator
+│   │                                 (forms / views / code / resources / pages / other)
 │   └── DxlProcessor.java             XML split, clean, and Java detection
 └── README.md
 ```
