@@ -36,6 +36,9 @@ import java.util.Set;
  *                           {@code <navigator>}</li>
  *   <li><b>other/</b>     – Database script/icon, Help About/Using, data connections,
  *                           replication formulas, profile documents, misc design notes</li>
+ *   <li><b>acl/</b>      &ndash; Database ACL ({@code <acl>} with all
+ *                           {@code <aclentry>} and {@code <role>} children).
+ *                           Pretty-printed for human review.</li>
  * </ul>
  *
  * <p>Anything Java &mdash; Java agents, Java Script Libraries, and Java Resources
@@ -55,8 +58,10 @@ import java.util.Set;
  *       {@code feature.xml}, {@code MANIFEST.MF}). Regenerated on rebuild.</li>
  * </ul>
  *
- * <p>The ACL is <b>not</b> exported here. It can be exported as DXL via
- * {@code NoteCollection.setSelectACL(true)} but is handled by a separate tool.
+ * <p>The database ACL is exported by {@link #exportACL()} to {@code acl/acl.dxl}
+ * via {@code NoteCollection.setSelectAcl(true)}. The ACL is pretty-printed for
+ * easy human review &mdash; unlike the other categories, which preserve Domino's
+ * compact formatting because they may embed code where whitespace is significant.
  *
  * <p>Each design element is written to its own {@code .dxl} file. The DXL is
  * cleaned before writing: database-specific attributes ({@code replicaid},
@@ -90,7 +95,7 @@ public class DesignExporter {
 
     /**
      * Export every design category in order:
-     * forms → views → code → resources → pages → other.
+     * forms → views → code → resources → pages → other → acl.
      *
      * <p>{@code exportForms} and {@code exportViews} also populate
      * {@code shared/subforms/}, {@code shared/fields/}, and
@@ -103,6 +108,7 @@ public class DesignExporter {
         exportResources();
         exportPages();
         exportOther();
+        exportACL();
     }
 
     /**
@@ -270,6 +276,87 @@ public class DesignExporter {
         skipTypes.add("sharedcolumn");
 
         exportCollection(nc, dir, /* skipJava= */ true, null, skipTypes);
+        nc.recycle();
+    }
+
+    /**
+     * Export the database ACL to {@code <outputDir>/acl/acl.dxl}.
+     *
+     * <p>The ACL is selected via {@code NoteCollection.setSelectAcl(true)} and
+     * routed through the same cleaning pipeline as design elements: source-replica
+     * attributes ({@code replicaid}, {@code path}, {@code title}, ...) are stripped
+     * from the {@code <database>} wrapper and any note metadata
+     * ({@code <noteinfo>}, {@code <updatedby>}, {@code <wassignedby>}) is removed.
+     *
+     * <p>Unlike other categories, the resulting DXL is then <b>pretty-printed</b>
+     * via {@link DxlProcessor#prettyPrint(String)} so a reviewer can read the
+     * {@code <aclentry>}, {@code <aclflags>}, and {@code <role>} children at a
+     * glance. ACL DXL contains no embedded code, so re-indentation is safe.
+     *
+     * <p>Only one {@code <acl>} element is expected per database; if Domino
+     * unexpectedly returns more than one, each is written with a numeric suffix
+     * ({@code acl_1.dxl}, {@code acl_2.dxl}, ...) so nothing is silently dropped.
+     */
+    public void exportACL() throws Exception {
+        File aclDir = mkdirs("acl");
+        System.out.println("=== Exporting ACL ===");
+
+        NoteCollection nc = db.createNoteCollection(false);
+        nc.setSelectAcl(true);
+        nc.buildCollection();
+
+        DxlExporter exporter = session.createDxlExporter();
+        String rawDxl = exporter.exportDxl(nc);
+        exporter.recycle();
+
+        DxlProcessor processor = new DxlProcessor(rawDxl);
+        List<DxlProcessor.DesignElement> elements = processor.splitElements();
+
+        // Filter to just the ACL element(s) — defensive, in case Domino emits
+        // anything else under <database> when only ACL is selected.
+        int aclCount = 0;
+        for (DxlProcessor.DesignElement e : elements) {
+            if ("acl".equalsIgnoreCase(e.getType())) aclCount++;
+        }
+
+        if (aclCount == 0) {
+            System.out.println("  No <acl> element returned by DxlExporter — skipping.");
+            System.out.println();
+            nc.recycle();
+            return;
+        }
+
+        int written     = 0;
+        int aclSeen     = 0;
+        int skippedOther = 0;
+
+        for (DxlProcessor.DesignElement element : elements) {
+            if (!"acl".equalsIgnoreCase(element.getType())) {
+                System.out.println("  [SKIP unexpected " + element.getType()
+                        + "] in ACL export");
+                skippedOther++;
+                continue;
+            }
+            aclSeen++;
+
+            String filename = (aclCount == 1) ? "acl.dxl" : "acl_" + aclSeen + ".dxl";
+            File outputFile = new File(aclDir, filename);
+
+            String prettyDxl = DxlProcessor.prettyPrint(element.getCleanDxl());
+            try (PrintWriter pw = new PrintWriter(
+                    new OutputStreamWriter(new FileOutputStream(outputFile), "UTF-8"))) {
+                pw.print(prettyDxl);
+            }
+
+            System.out.println("  Exported: " + relativise(outputFile));
+            written++;
+        }
+
+        StringBuilder summary = new StringBuilder("  Total exported: ").append(written);
+        if (skippedOther > 0) summary.append(", skipped (other): ").append(skippedOther);
+        System.out.println(summary);
+        System.out.println();
+
         nc.recycle();
     }
 

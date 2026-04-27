@@ -88,8 +88,21 @@ public class DxlProcessor {
      * Children of a design-element note that contain metadata about the source
      * replica and should be removed before re-import.
      */
+    /**
+     * Children of a design-element note that contain source-replica metadata
+     * or history information and should be removed before re-import.
+     *
+     * <ul>
+     *   <li>{@code <noteinfo>}, {@code <updatedby>}, {@code <wassignedby>} &mdash;
+     *       per-note metadata about the source replica (NOTEID, sequence,
+     *       last-edit user, signer).</li>
+     *   <li>{@code <logentry>} &mdash; appears only inside {@code <acl>}; each
+     *       entry is a change-history line (timestamp + admin + action). Pure
+     *       source-database history, never relevant in a target.</li>
+     * </ul>
+     */
     private static final Set<String> NOTE_CHILDREN_TO_REMOVE = new HashSet<>(Arrays.asList(
-            "noteinfo", "updatedby", "wassignedby"
+            "noteinfo", "updatedby", "wassignedby", "logentry"
     ));
 
     /**
@@ -206,6 +219,76 @@ public class DxlProcessor {
         }
 
         return result;
+    }
+
+    /**
+     * Re-format a DXL XML string with indentation so it can be reviewed
+     * by humans. Whitespace-only text nodes from the input are stripped
+     * before re-serialisation so the indenting transformer can apply a
+     * consistent style.
+     *
+     * <p>Use sparingly &mdash; pretty-printing is safe for elements whose
+     * content is purely structural (e.g. {@code <acl>} with {@code <aclentry>}
+     * and {@code <role>} children) but is <b>not</b> safe for elements that
+     * embed code (LotusScript, formula, JavaScript, HTML) inside text nodes
+     * where whitespace is significant.
+     *
+     * @param xml DXL XML string (with or without DOCTYPE declaration)
+     * @return The same DXL pretty-printed; the {@code <?xml?>} declaration is
+     *         normalised to single quotes / lowercase encoding to match the
+     *         rest of the export, and a trailing newline is ensured.
+     * @throws Exception on XML parse / transform errors
+     */
+    public static String prettyPrint(String xml) throws Exception {
+        Document doc = parseDxl(xml);
+        stripWhitespaceTextNodes(doc.getDocumentElement());
+
+        TransformerFactory tf          = TransformerFactory.newInstance();
+        Transformer        transformer = tf.newTransformer();
+
+        transformer.setOutputProperty(OutputKeys.ENCODING,             "UTF-8");
+        transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "no");
+        transformer.setOutputProperty(OutputKeys.DOCTYPE_SYSTEM,       DOCTYPE_SYSTEM);
+        transformer.setOutputProperty(OutputKeys.INDENT,               "yes");
+        try {
+            transformer.setOutputProperty(
+                    "{http://xml.apache.org/xslt}indent-amount", "2");
+        } catch (IllegalArgumentException ignored) {
+            // Older XSLT engines may not support this property; the default
+            // indent (usually 2 spaces) is acceptable.
+        }
+
+        StringWriter sw = new StringWriter();
+        transformer.transform(new DOMSource(doc), new StreamResult(sw));
+
+        String out = sw.toString();
+        out = out.replaceFirst(
+                "<\\?xml[^?]*\\?>",
+                "<?xml version='1.0' encoding='utf-8'?>");
+        if (!out.endsWith("\n")) out = out + "\n";
+        return out;
+    }
+
+    /**
+     * Recursively remove whitespace-only text nodes from a DOM subtree.
+     * Used as a pre-pass for {@link #prettyPrint(String)} so the indenting
+     * transformer is not confused by pre-existing whitespace.
+     */
+    private static void stripWhitespaceTextNodes(Node node) {
+        NodeList children = node.getChildNodes();
+        List<Node> toRemove = new ArrayList<>();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node child = children.item(i);
+            if (child.getNodeType() == Node.TEXT_NODE) {
+                String txt = child.getNodeValue();
+                if (txt == null || txt.trim().isEmpty()) {
+                    toRemove.add(child);
+                }
+            } else if (child.getNodeType() == Node.ELEMENT_NODE) {
+                stripWhitespaceTextNodes(child);
+            }
+        }
+        for (Node n : toRemove) node.removeChild(n);
     }
 
     // -----------------------------------------------------------------------

@@ -23,9 +23,8 @@ import java.util.Arrays;
  *     pages/      – Pages, framesets, outlines, navigators
  *     other/      – Database script/icon, Help About/Using, data connections,
  *                   replication formulas, profile documents, misc design notes
+ *     acl/        – Database ACL (pretty-printed for human review)
  * </pre>
- *
- * <p>The ACL is not exported here; it is handled by a separate tool.
  *
  * <p>Each exported file is cleaned for re-import: database-specific attributes
  * (replicaid, path, title, etc.) and note metadata (noteinfo, updatedby,
@@ -329,7 +328,6 @@ public class DominoBlueprintExporter {
         System.out.println("  <outputDir>/pages/      – Pages, framesets, outlines, navigators");
         System.out.println("  <outputDir>/other/      – Database script/icon, Help docs, data connections,");
         System.out.println("                            replication formulas, profile docs, misc design");
-        System.out.println();
-        System.out.println("Note: ACL is not exported by this tool.");
+        System.out.println("  <outputDir>/acl/        – Database ACL (pretty-printed for human review)");
     }
 }
