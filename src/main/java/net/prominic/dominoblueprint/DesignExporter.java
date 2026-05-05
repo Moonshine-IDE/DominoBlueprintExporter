@@ -25,9 +25,10 @@ import java.util.Set;
  *   <li><b>views/</b>     – {@code <view>}, {@code <folder>}</li>
  *   <li><b>shared/</b>    – Reusable design elements that multiple forms/views can
  *                           reference:
- *                           {@code shared/subforms/} ({@code <subform>}),
- *                           {@code shared/fields/} ({@code <sharedfield>}),
- *                           {@code shared/columns/} ({@code <sharedcolumn>}).</li>
+ *                           {@code shared/subforms/} ({@code <subform>}, from {@link #exportForms()}),
+ *                           {@code shared/fields/} ({@code <sharedfield>}, from {@link #exportForms()}),
+ *                           {@code shared/columns/} ({@code <sharedcolumn>}, from {@link #exportOther()}
+ *                           via {@code setSelectMiscIndexElements}).</li>
  *   <li><b>code/</b>      – {@code <agent>}, {@code <scriptlibrary>},
  *                           {@code <sharedactions>} (Java agents/libraries are skipped)</li>
  *   <li><b>resources/</b> – {@code <imageresource>}, {@code <stylesheetresource>},
@@ -142,16 +143,19 @@ public class DesignExporter {
     }
 
     /**
-     * Export views and folders to {@code <outputDir>/views/}, routing shared
-     * columns into {@code <outputDir>/shared/columns/}.
+     * Export views and folders to {@code <outputDir>/views/}.
      *
-     * <p>Note: there is no {@code setSelectSharedColumns()} in the standard
-     * {@code NoteCollection} API.  Shared columns share the same note class as
-     * views ({@code NOTE_CLASS_VIEW}), so they are automatically included when
-     * {@code setSelectViews(true)} is set.  {@code DxlExporter} outputs
-     * {@code <sharedcolumn>} elements (rather than {@code <view>}) for them
-     * based on each note's design flags &mdash; routing applied below sends
-     * them to {@code shared/columns/}.
+     * <p>Shared columns are <b>not</b> picked up by this pass &mdash; despite
+     * sharing {@code NOTE_CLASS_VIEW} with views, {@code setSelectViews(true)}
+     * matches only notes whose design flag identifies them as a real view, not
+     * the shared-column flag ({@code =}). They are collected in
+     * {@link #exportOther()} via {@code setSelectMiscIndexElements(true)} and
+     * routed from there to {@code shared/columns/}.
+     *
+     * <p>The {@code sharedcolumn} type is still listed in the routing map below
+     * as defensive insurance &mdash; if a future Domino release does emit a
+     * {@code <sharedcolumn>} element from a views-only collection, it will be
+     * filed correctly rather than landing in {@code views/}.
      */
     public void exportViews() throws Exception {
         File viewsDir   = mkdirs("views");
@@ -159,12 +163,12 @@ public class DesignExporter {
         System.out.println("=== Exporting Views ===");
 
         NoteCollection nc = db.createNoteCollection(false);
-        nc.setSelectViews(true);    // also captures shared columns (same note class)
+        nc.setSelectViews(true);
         nc.setSelectFolders(true);
         nc.buildCollection();
 
         Map<String, File> routes = new HashMap<>();
-        routes.put("sharedcolumn", columnsDir);
+        routes.put("sharedcolumn", columnsDir);   // defensive — see Javadoc
 
         exportCollection(nc, viewsDir, /* skipJava= */ false, routes, null);
         nc.recycle();
@@ -244,14 +248,22 @@ public class DesignExporter {
      * filtered out &mdash; this mirrors the {@code code/} policy of excluding
      * Java from the DXL round-trip.
      *
-     * <p>{@code setSelectMiscIndexElements(true)} also re-catches shared columns
-     * (same note class as views), and {@code setSelectMiscCodeElements} can pick
-     * up subforms/shared fields in some DBs. Those are already exported by
-     * {@link #exportForms()} / {@link #exportViews()} and routed into
-     * {@code shared/}, so they are filtered out here to prevent duplicates.
+     * <p><b>Shared columns.</b> {@code setSelectMiscIndexElements(true)} is the
+     * only selector that actually emits {@code <sharedcolumn>} elements
+     * &mdash; {@code setSelectViews(true)} does not include them despite the
+     * shared note class, because Domino filters by design flag (the
+     * shared-column flag {@code =} is excluded from the views select).
+     * Shared columns therefore originate here and are routed to
+     * {@code <outputDir>/shared/columns/} via the type-route map below.
+     *
+     * <p><b>Duplicate suppression.</b> {@code setSelectMiscCodeElements} can
+     * occasionally pick up subforms or shared fields that were already
+     * exported by {@link #exportForms()}; those are filtered out via
+     * {@code skipTypes} to avoid double-writes.
      */
     public void exportOther() throws Exception {
-        File dir = mkdirs("other");
+        File dir        = mkdirs("other");
+        File columnsDir = mkdirs("shared/columns");
         System.out.println("=== Exporting Other ===");
 
         NoteCollection nc = db.createNoteCollection(false);
@@ -267,15 +279,20 @@ public class DesignExporter {
         nc.setSelectMiscIndexElements(true);
         nc.buildCollection();
 
-        // Shared design elements occasionally leak into the "misc" buckets above;
-        // they've already been written to shared/ by exportForms/exportViews, so
-        // skip them here to avoid duplicates.
+        // Route shared columns out of "other/" and into shared/columns/.
+        // setSelectMiscIndexElements(true) above is the source for them.
+        Map<String, File> routes = new HashMap<>();
+        routes.put("sharedcolumn", columnsDir);
+
+        // Subforms / shared fields can leak into the "misc" buckets above; they
+        // were already written to shared/ by exportForms(), so skip them here
+        // to prevent duplicates. Shared columns are intentionally NOT skipped
+        // — this method is where they are produced.
         Set<String> skipTypes = new HashSet<>();
         skipTypes.add("subform");
         skipTypes.add("sharedfield");
-        skipTypes.add("sharedcolumn");
 
-        exportCollection(nc, dir, /* skipJava= */ true, null, skipTypes);
+        exportCollection(nc, dir, /* skipJava= */ true, routes, skipTypes);
         nc.recycle();
     }
 

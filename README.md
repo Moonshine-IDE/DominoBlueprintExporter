@@ -249,9 +249,12 @@ forms and views can reference. Rather than burying them inside `forms/` and
 top-level `forms/` and `views/` directories focused on the first-class design
 containers and makes the shared-element counts easier to see at a glance.
 Because `NoteCollection` exposes no `setSelectSharedColumns()`, shared columns
-are collected alongside views (they share `NOTE_CLASS_VIEW`) and then routed
-to `shared/columns/` based on the `<sharedcolumn>` tag emitted by
-`DxlExporter`.
+have to be collected via `setSelectMiscIndexElements(true)` — `setSelectViews`
+does *not* pick them up despite shared columns sharing `NOTE_CLASS_VIEW` with
+views, because Domino filters by design flag (the shared-column flag `=` is
+excluded from the views select). They are emitted by `DxlExporter` as
+`<sharedcolumn>` elements during the `exportOther()` pass and routed from there
+to `shared/columns/`.
 
 ## Design note: ACL
 
