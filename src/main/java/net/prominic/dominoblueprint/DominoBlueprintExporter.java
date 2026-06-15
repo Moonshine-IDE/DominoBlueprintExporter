@@ -18,7 +18,15 @@ import java.util.Arrays;
  *   &lt;outputDir&gt;/
  *     forms/      – Forms, subforms, shared fields
  *     views/      – Views, folders, shared columns
- *     code/       – Agents, Script Libraries, shared actions  (Java code excluded)
+ *     code/agents/formula/            – Formula agents
+ *     code/agents/imported_java/      – Imported (JAR-only) Java agents (exclude for DXLImport source import)
+ *     code/agents/java/               – Java agents with editable source (exclude for DXLImport source import)
+ *     code/agents/lotusscript/        – LotusScript agents
+ *     code/agents/simple/             – Simple action agents
+ *     code/script_libraries/imported_java/ – Imported (JAR-only) Java script libraries (exclude for DXLImport)
+ *     code/script_libraries/java/     – Java script libraries with editable source (exclude for DXLImport)
+ *     code/script_libraries/lotusscript/ – LotusScript script libraries
+ *     code/                           – Shared actions and unclassified code
  *     resources/  – Image, stylesheet, and file resources     (Java resources excluded)
  *     pages/      – Pages, framesets, outlines, navigators
  *     other/      – Database script/icon, Help About/Using, data connections,
@@ -323,8 +331,18 @@ public class DominoBlueprintExporter {
         System.out.println("Output structure:");
         System.out.println("  <outputDir>/forms/      – Forms, subforms, shared fields");
         System.out.println("  <outputDir>/views/      – Views, folders, shared columns");
-        System.out.println("  <outputDir>/code/       – Agents, Script Libraries, shared actions (non-Java)");
-        System.out.println("  <outputDir>/resources/  – Image, stylesheet, and file resources (non-Java)");
+        System.out.println("  <outputDir>/code/agents/formula/            – Formula agents");
+        System.out.println("  <outputDir>/code/agents/imported_java/      – Imported (JAR-only) Java agents (exclude for DXLImport)");
+        System.out.println("  <outputDir>/code/agents/java/               – Java agents with editable source (exclude for DXLImport)");
+        System.out.println("  <outputDir>/code/agents/lotusscript/        – LotusScript agents");
+        System.out.println("  <outputDir>/code/agents/simple/             – Simple action agents");
+        System.out.println("  <outputDir>/code/script_libraries/imported_java/ – Imported (JAR-only) Java script libraries (exclude for DXLImport)");
+        System.out.println("  <outputDir>/code/script_libraries/java/        – Java script libraries with editable source (exclude for DXLImport)");
+        System.out.println("  <outputDir>/code/script_libraries/javascript/   – Client-side JavaScript libraries");
+        System.out.println("  <outputDir>/code/script_libraries/lotusscript/  – LotusScript libraries");
+        System.out.println("  <outputDir>/code/script_libraries/ssjs/         – Server-Side JavaScript (XPages) libraries");
+        System.out.println("  <outputDir>/code/                           – Shared actions and unclassified code");
+        System.out.println("  <outputDir>/resources/         – Image, stylesheet, and file resources (non-Java)");
         System.out.println("  <outputDir>/pages/      – Pages, framesets, outlines, navigators");
         System.out.println("  <outputDir>/other/      – Database script/icon, Help docs, data connections,");
         System.out.println("                            replication formulas, profile docs, misc design");

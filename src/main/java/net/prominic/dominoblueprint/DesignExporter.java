@@ -29,10 +29,21 @@ import java.util.Set;
  *                           {@code shared/fields/} ({@code <sharedfield>}, from {@link #exportForms()}),
  *                           {@code shared/columns/} ({@code <sharedcolumn>}, from {@link #exportOther()}
  *                           via {@code setSelectMiscIndexElements}).</li>
- *   <li><b>code/</b>      – {@code <agent>}, {@code <scriptlibrary>},
- *                           {@code <sharedactions>} (Java agents/libraries are skipped)</li>
- *   <li><b>resources/</b> – {@code <imageresource>}, {@code <stylesheetresource>},
- *                           {@code <fileresource>} (Java resources are skipped)</li>
+ *   <li><b>code/agents/formula/</b>       – Formula agents</li>
+ *   <li><b>code/agents/imported_java/</b> – Java agents imported as a JAR (no editable source;
+ *                                           {@code <javaproject imported="true">})</li>
+ *   <li><b>code/agents/java/</b>          – Java agents with source in Designer
+ *                                           (exclude when using DXLImport for Java source import)</li>
+ *   <li><b>code/agents/lotusscript/</b>   – LotusScript agents</li>
+ *   <li><b>code/agents/simple/</b>         – Simple action agents</li>
+ *   <li><b>code/script_libraries/imported_java/</b> – Java script libraries imported as a JAR</li>
+ *   <li><b>code/script_libraries/java/</b>          – Java script libraries with source in Designer</li>
+ *   <li><b>code/script_libraries/javascript/</b>  – Client-side JavaScript script libraries</li>
+ *   <li><b>code/script_libraries/lotusscript/</b> – LotusScript script libraries</li>
+ *   <li><b>code/script_libraries/ssjs/</b>        – Server-Side JavaScript (XPages) script libraries</li>
+ *   <li><b>code/</b>                      – Shared actions and any remaining code elements</li>
+ *   <li><b>resources/</b>          – {@code <imageresource>}, {@code <stylesheetresource>},
+ *                                   {@code <fileresource>} (Java resources are skipped)</li>
  *   <li><b>pages/</b>     – {@code <page>}, {@code <frameset>}, {@code <outline>},
  *                           {@code <navigator>}</li>
  *   <li><b>other/</b>     – Database script/icon, Help About/Using, data connections,
@@ -42,10 +53,14 @@ import java.util.Set;
  *                           Pretty-printed for human review.</li>
  * </ul>
  *
- * <p>Anything Java &mdash; Java agents, Java Script Libraries, and Java Resources
- * &mdash; is always excluded from the export. Compiled Java code does not round-trip
- * reliably through {@code DxlImporter}; import it separately using the Gradle build
- * in {@code DXLImporter-Gradle-Demo/}.
+ * <p>Java agents and Java script libraries are exported to dedicated subdirectories
+ * ({@code code/java-agents/} and {@code code/java-libraries/}) rather than being skipped.
+ * This lets AI tools edit them as DXL directly. Users who prefer to import Java agents
+ * from source via the Prominic DXLImport Gradle project can exclude those subdirectories.
+ *
+ * <p>Java <em>resources</em> (compiled {@code .class} files stored as
+ * {@code <javaresource>} elements) are still skipped; they do not round-trip through
+ * {@code DxlImporter} and should be rebuilt from source.
  *
  * <p>Two additional noise categories are filtered out by {@link DxlProcessor} and
  * skipped automatically:
@@ -184,7 +199,22 @@ public class DesignExporter {
      * database, which the DXL splitter emits as one file.
      */
     public void exportCode() throws Exception {
-        File dir = mkdirs("code");
+        // Agents sub-categorized by language
+        File agentsDir       = mkdirs("code/agents");
+        File agFormulaDir    = mkdirs("code/agents/formula");
+        File agImportedJaDir = mkdirs("code/agents/imported_java");
+        File agJavaDir       = mkdirs("code/agents/java");
+        File agLSDir         = mkdirs("code/agents/lotusscript");
+        File agSimpleDir     = mkdirs("code/agents/simple");
+        // Script libraries sub-categorized by language
+        File libsDir         = mkdirs("code/script_libraries");
+        File libImportedJaDir= mkdirs("code/script_libraries/imported_java");
+        File libJavaDir      = mkdirs("code/script_libraries/java");
+        File libJSDir        = mkdirs("code/script_libraries/javascript");
+        File libLSDir        = mkdirs("code/script_libraries/lotusscript");
+        File libSSJSDir      = mkdirs("code/script_libraries/ssjs");
+        // Shared actions and any unclassified code elements land here
+        File codeDir      = mkdirs("code");
         System.out.println("=== Exporting Code ===");
 
         NoteCollection nc = db.createNoteCollection(false);
@@ -193,7 +223,30 @@ public class DesignExporter {
         nc.setSelectActions(true);   // shared actions container
         nc.buildCollection();
 
-        exportCollection(nc, dir, /* skipJava= */ true, null, null);
+        // Route by compound "type:language" key.  Empty-language entries ("") act as
+        // catch-alls for agents/libraries whose language could not be determined.
+        Map<String, File> languageRoutes = new HashMap<>();
+        languageRoutes.put("agent:imported_java",      agImportedJaDir);
+        languageRoutes.put("agent:java",               agJavaDir);
+        languageRoutes.put("agent:lotusscript",        agLSDir);
+        languageRoutes.put("agent:formula",            agFormulaDir);
+        languageRoutes.put("agent:simple",             agSimpleDir);
+        languageRoutes.put("agent:",                   agentsDir);   // unknown-language fallback
+        languageRoutes.put("scriptlibrary:imported_java", libImportedJaDir);
+        languageRoutes.put("scriptlibrary:java",          libJavaDir);
+        languageRoutes.put("scriptlibrary:javascript",    libJSDir);
+        languageRoutes.put("scriptlibrary:lotusscript",   libLSDir);
+        languageRoutes.put("scriptlibrary:ssjs",          libSSJSDir);
+        languageRoutes.put("scriptlibrary:",              libsDir);  // unknown-language fallback
+
+        // Within typed subdirectories the directory name already communicates the
+        // element type, so the "_Agent" / "_ScriptLibrary" filename suffix is redundant.
+        Set<String> suppressSuffix = new HashSet<>();
+        suppressSuffix.add("agent");
+        suppressSuffix.add("scriptlibrary");
+
+        exportCollection(nc, codeDir, /* skipJava= */ false, null, null,
+                         languageRoutes, suppressSuffix);
         nc.recycle();
     }
 
@@ -410,14 +463,39 @@ public class DesignExporter {
      *                    to the mapped directory instead of {@code defaultDir}. May be {@code null}.
      * @param skipTypes   Optional set of lowercase type names to skip entirely. May be {@code null}.
      */
+    /** Overload for call sites that do not supply java-specific routing. */
     private void exportCollection(NoteCollection nc, File defaultDir, boolean skipJava,
                                   Map<String, File> typeRoutes,
                                   Set<String> skipTypes)
             throws Exception {
+        exportCollection(nc, defaultDir, skipJava, typeRoutes, skipTypes, null, null);
+    }
+
+    /**
+     * Full implementation.
+     *
+     * <p>{@code languageRoutes} is a compound-key map whose keys have the form
+     * {@code "type:language"} (e.g. {@code "agent:java"}, {@code "scriptlibrary:lotusscript"}).
+     * A key of {@code "type:"} (empty language) acts as a catch-all for elements
+     * of that type whose language could not be determined. When {@code null} or empty,
+     * routing falls through to {@code typeRoutes} / {@code defaultDir}.
+     *
+     * <p>{@code suppressSuffixTypes} lists element types (e.g. {@code "agent"},
+     * {@code "scriptlibrary"}) for which the {@code _TypeSuffix} portion of the
+     * filename is omitted because the subdirectory already conveys the type.
+     */
+    private void exportCollection(NoteCollection nc, File defaultDir, boolean skipJava,
+                                  Map<String, File> typeRoutes,
+                                  Set<String> skipTypes,
+                                  Map<String, File> languageRoutes,
+                                  Set<String> suppressSuffixTypes)
+            throws Exception {
 
         // Normalise nulls so the loop below doesn't have to branch
-        if (typeRoutes == null) typeRoutes = Collections.emptyMap();
-        if (skipTypes  == null) skipTypes  = Collections.emptySet();
+        if (typeRoutes         == null) typeRoutes         = Collections.emptyMap();
+        if (skipTypes          == null) skipTypes          = Collections.emptySet();
+        if (languageRoutes     == null) languageRoutes     = Collections.emptyMap();
+        if (suppressSuffixTypes== null) suppressSuffixTypes= Collections.emptySet();
 
         // Ask Domino to export the whole collection as DXL in one pass.
         // Note: NoteCollection has no getNoteCount() method; we derive the count
@@ -440,6 +518,7 @@ public class DesignExporter {
 
         int exported      = 0;
         int skippedJava   = 0;
+        int skippedGhost  = 0;
         int skippedOther  = 0;
 
         for (DxlProcessor.DesignElement element : elements) {
@@ -453,7 +532,20 @@ public class DesignExporter {
                 continue;
             }
 
-            // 2. Excluded-by-DxlProcessor (private repl formulas, XPages build artifacts)
+            // 2. Ghost notes — empty deletion stubs left in the source NSF
+            //    (typically NOTE_CLASS_FILTER notes with only $FLAGS/$UpdatedBy
+            //    items, both empty). They round-trip as 244-byte empty
+            //    <agent><trigger/></agent> stubs with no recoverable design info,
+            //    so we drop them here. Cleanup at the source: `load compact -c -D
+            //    <db>.nsf`, then `load fixup <db>.nsf -F -J` if any survive.
+            if (element.isGhost()) {
+                System.out.println("  [SKIP ghost] " + element.getType()
+                        + " (empty stub — no name, no content)");
+                skippedGhost++;
+                continue;
+            }
+
+            // 3. Excluded-by-DxlProcessor (private repl formulas, XPages build artifacts)
             if (element.isExcluded()) {
                 System.out.println("  [SKIP " + element.getExcludedReason() + "] "
                         + element.getType() + ": " + element.getName());
@@ -461,15 +553,26 @@ public class DesignExporter {
                 continue;
             }
 
-            // 3. Java code (only skipped in categories where Java doesn't round-trip)
-            if (skipJava && element.isJava()) {
+            // 4. Java code: skip only when explicitly requested (skipJava=true).
+            //    Otherwise fall through and let languageRoutes handle the directory.
+            if (element.isJava() && skipJava) {
                 System.out.println("  [SKIP Java] " + element.getType() + ": " + element.getName());
                 skippedJava++;
                 continue;
             }
 
-            // Route by type (shared elements land in shared/<kind>/)
-            File targetDir = typeRoutes.getOrDefault(typeKey, defaultDir);
+            // Route by compound "type:language" key first, then plain type route, then default.
+            String lang    = element.getLanguage();
+            String langKey = typeKey + ":" + (lang != null ? lang : "");
+            File targetDir;
+            if (!languageRoutes.isEmpty() && languageRoutes.containsKey(langKey)) {
+                targetDir = languageRoutes.get(langKey);
+            } else if (!languageRoutes.isEmpty() && languageRoutes.containsKey(typeKey + ":")) {
+                // Fallback: type catch-all ("type:") for unrecognised/null language
+                targetDir = languageRoutes.get(typeKey + ":");
+            } else {
+                targetDir = typeRoutes.getOrDefault(typeKey, defaultDir);
+            }
 
             // Build a safe filename. Elements with a meaningful name (most forms,
             // views, agents, resources) get <SanitizedName>_<TypeSuffix>.dxl.
@@ -477,9 +580,16 @@ public class DesignExporter {
             // database script) use just <TypeSuffix>.dxl so we don't end up with
             // "unknown_DatabaseIcon.dxl".
             String sanitizedName = sanitize(element.getName());
-            String filename = "unknown".equals(sanitizedName)
-                    ? element.getTypeSuffix() + ".dxl"
-                    : sanitizedName + "_" + element.getTypeSuffix() + ".dxl";
+            boolean useSuffix = !suppressSuffixTypes.contains(typeKey);
+            String filename;
+            if ("unknown".equals(sanitizedName)) {
+                // Always use the suffix for unnamed elements to keep filenames descriptive
+                filename = element.getTypeSuffix() + ".dxl";
+            } else if (useSuffix) {
+                filename = sanitizedName + "_" + element.getTypeSuffix() + ".dxl";
+            } else {
+                filename = sanitizedName + ".dxl";
+            }
 
             // Avoid clobbering when two elements share a sanitised name
             filename = uniqueFilename(targetDir, filename);
@@ -499,6 +609,7 @@ public class DesignExporter {
 
         StringBuilder summary = new StringBuilder("  Total exported: ").append(exported);
         if (skippedJava  > 0) summary.append(", skipped (Java): ").append(skippedJava);
+        if (skippedGhost > 0) summary.append(", skipped (ghost): ").append(skippedGhost);
         if (skippedOther > 0) summary.append(", skipped (other): ").append(skippedOther);
         System.out.println(summary);
         System.out.println();

@@ -212,10 +212,12 @@ public class DxlProcessor {
             String  type     = resolveType(el);
             String  name     = resolveName(el);
             boolean isJava   = isJavaElement(el);
+            boolean isGhost  = isGhostElement(el);
             String  excluded = resolveExclusion(type, name);
+            String  language = resolveLanguage(el, type, isJava);
             String  cleanDxl = buildCleanDxl(database, el);
 
-            result.add(new DesignElement(type, name, isJava, excluded, cleanDxl));
+            result.add(new DesignElement(type, name, isJava, isGhost, excluded, language, cleanDxl));
         }
 
         return result;
@@ -394,6 +396,92 @@ public class DxlProcessor {
     }
 
     /**
+     * Return {@code true} if this element is a <b>ghost note</b>: a NOTE_CLASS_FILTER
+     * (or similar) note whose payload has been emptied, leaving only stub items
+     * such as an empty {@code $FLAGS} and empty {@code $UpdatedBy}. This is the
+     * signature of a soft-deleted design element whose deletion stub has not yet
+     * been purged from the database.
+     *
+     * <p>Concretely, an element is treated as a ghost when <b>all</b> of these
+     * conditions hold:
+     * <ul>
+     *   <li>The element has no {@code name} or {@code title} attribute, and
+     *       no {@code $FileNames} or {@code $TITLE} item with text content
+     *       (i.e. {@link #resolveName(Element)} would return {@code "unknown"}).</li>
+     *   <li>No child {@code <item>} has non-empty text content. Empty stub
+     *       items like {@code <item name="$FLAGS"><text/></item>} or
+     *       {@code <item name="$UpdatedBy"><text/></item>} do not count as
+     *       content.</li>
+     *   <li>The element has no structural children other than an empty
+     *       {@code <trigger/>}. A real agent has a {@code <code>},
+     *       {@code <simpleaction>}, or {@code <documentset>} child; a real
+     *       form has {@code <par>}/{@code <pardef>} children; etc.</li>
+     * </ul>
+     *
+     * <p>Ghost notes carry no recoverable design information &mdash; they
+     * round-trip as empty stub files (244 bytes for {@code <agent>}) &mdash;
+     * and would only add noise to a versioned export, so the exporter skips
+     * them with a {@code [SKIP ghost]} log entry rather than writing them.
+     *
+     * <p>The fix on the source database side is to run a server-side compact
+     * with the discard option ({@code load compact -c -D <db>.nsf}) so the
+     * expired deletion stubs are purged; if any survive, {@code load fixup
+     * <db>.nsf -F -J} forces a design-note rebuild.
+     */
+    /**
+     * Element tags that are metadata or runtime state (not design content), so
+     * their presence on a design element does not disqualify it from being a
+     * ghost note. Includes everything the note-metadata cleaner strips
+     * ({@link #NOTE_CHILDREN_TO_REMOVE}) plus runtime/state elements Domino
+     * emits on every agent regardless of whether the agent has a body
+     * ({@code <designchange>}, {@code <rundata>}, {@code <trigger>},
+     * {@code <documentset>}, {@code <agentmodified>}).
+     */
+    private static final Set<String> GHOST_IGNORED_CHILDREN = new HashSet<>(Arrays.asList(
+            "noteinfo", "updatedby", "wassignedby", "logentry",
+            "designchange", "rundata", "agentmodified",
+            "trigger", "documentset"
+    ));
+
+    private static boolean isGhostElement(Element el) {
+        // 1. Has no usable name?
+        String attr = el.getAttribute("name");
+        if (attr != null && !attr.isEmpty()) return false;
+        attr = el.getAttribute("title");
+        if (attr != null && !attr.isEmpty()) return false;
+        if (itemText(el, "$FileNames") != null) return false;
+        if (itemText(el, "$TITLE")     != null) return false;
+
+        // 2. No <item> child with text content, and no structural children
+        //    other than known metadata / runtime-state tags.
+        NodeList children = el.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node n = children.item(i);
+            if (n.getNodeType() != Node.ELEMENT_NODE) continue;
+            Element child = (Element) n;
+            String  tag   = localName(child);
+
+            if ("item".equals(tag)) {
+                // Empty stub items (e.g. $FLAGS, $UpdatedBy with no text) are
+                // characteristic of ghost notes and do not disqualify.
+                String t = child.getTextContent();
+                if (t != null && !t.trim().isEmpty()) return false;
+            } else if (GHOST_IGNORED_CHILDREN.contains(tag)) {
+                // Metadata / runtime-state tags appear on every note Domino
+                // emits, including ghost stubs. They carry no design content,
+                // so they do not disqualify.
+                continue;
+            } else {
+                // Any other element (<code>, <simpleaction>, <formula>,
+                // <javaproject>, <par>, <pardef>, <viewformat>, <column>,
+                // <subform>, <actionbar>, ...) means real design content.
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Return {@code true} if the element itself, or any of its descendants, is a
      * Java design element.
      *
@@ -418,6 +506,96 @@ public class DxlProcessor {
             if (el.getElementsByTagName(javaTag).getLength() > 0) return true;
         }
         return false;
+    }
+
+    /**
+     * Resolve the coding language of an {@code <agent>} or {@code <scriptlibrary>}
+     * element by inspecting its XML structure. Returns one of:
+     * <ul>
+     *   <li>{@code "java"}          – {@code <javaproject>} present without
+     *                                  {@code imported="true"}: source is editable
+     *                                  in Designer.</li>
+     *   <li>{@code "imported_java"} – {@code <javaproject imported="true">}: the
+     *                                  agent/library was created by importing a JAR;
+     *                                  no editable source is stored in the NSF.</li>
+     *   <li>{@code "lotusscript"} – {@code <lotusscript>} descendant present.</li>
+     *   <li>{@code "javascript"}  – {@code <javascript>} descendant present
+     *                                (client-side JS library for web).</li>
+     *   <li>{@code "ssjs"}        – script library with a
+     *                                {@code $ServerJavaScriptLibrary} item
+     *                                (Server-Side JavaScript / XPages SSJS).</li>
+     *   <li>{@code "simple"}      – agent has a {@code <simpleaction>} descendant
+     *                                (checked before {@code "formula"} because simple
+     *                                actions wrap their formula inside
+     *                                {@code <simpleaction>}).</li>
+     *   <li>{@code "formula"}     – a {@code <code>} child of the element contains a
+     *                                {@code <formula>} descendant, or carries
+     *                                {@code language="formula"}. Note: Domino DXL
+     *                                does NOT emit {@code language="formula"} in
+     *                                practice — the formula is identified by the
+     *                                presence of the {@code <formula>} child element.</li>
+     *   <li>{@code null}           – element type does not have a language concept,
+     *                                or the language could not be determined.</li>
+     * </ul>
+     */
+    private static String resolveLanguage(Element el, String type, boolean isJava) {
+        if (isJava) {
+            // Distinguish imported Java (JAR-only, no editable source) from
+            // non-imported Java (source written/visible in Designer).
+            // The <javaproject> element carries imported="true" when the agent
+            // or library was created by importing a JAR rather than authoring source.
+            NodeList jpNodes = el.getElementsByTagNameNS("*", "javaproject");
+            if (jpNodes.getLength() == 0) jpNodes = el.getElementsByTagName("javaproject");
+            for (int i = 0; i < jpNodes.getLength(); i++) {
+                Node n = jpNodes.item(i);
+                if (n.getNodeType() != Node.ELEMENT_NODE) continue;
+                if ("true".equalsIgnoreCase(((Element) n).getAttribute("imported"))) {
+                    return "imported_java";
+                }
+            }
+            return "java";
+        }
+        if (!"agent".equals(type) && !"scriptlibrary".equals(type)) return null;
+
+        // LotusScript: <lotusscript> element anywhere inside the design element
+        if (hasDescendantNamed(el, "lotusscript")) return "lotusscript";
+
+        // Client-side JavaScript library: <javascript> element
+        if (hasDescendantNamed(el, "javascript")) return "javascript";
+
+        // Server-Side JavaScript (XPages SSJS): stored as raw binary in a
+        // $ServerJavaScriptLibrary item — no <code> wrapper is emitted.
+        if ("scriptlibrary".equals(type) && hasItemNamed(el, "$ServerJavaScriptLibrary")) {
+            return "ssjs";
+        }
+
+        // Simple action agents: <simpleaction> must be detected BEFORE formula because
+        // a simple action can contain a <formula> child inside <simpleaction>.
+        if ("agent".equals(type) && hasDescendantNamed(el, "simpleaction")) return "simple";
+
+        // Formula: look for a <formula> element inside any <code> child, or an explicit
+        // language="formula" attribute (defensive — Domino DXL does not emit this in practice).
+        NodeList codeNodes = el.getElementsByTagNameNS("*", "code");
+        if (codeNodes.getLength() == 0) codeNodes = el.getElementsByTagName("code");
+        for (int i = 0; i < codeNodes.getLength(); i++) {
+            Node n = codeNodes.item(i);
+            if (n.getNodeType() != Node.ELEMENT_NODE) continue;
+            Element codeEl = (Element) n;
+            if ("formula".equalsIgnoreCase(codeEl.getAttribute("language"))) return "formula";
+            if (hasDescendantNamed(codeEl, "formula")) return "formula";
+        }
+
+        return null;  // language undetermined
+    }
+
+    /**
+     * Return {@code true} if {@code el} has any descendant element with the given
+     * local name. Tries namespace-aware lookup first, then falls back to plain tag-name
+     * lookup for parsers that do not preserve namespace information.
+     */
+    private static boolean hasDescendantNamed(Element el, String tagName) {
+        if (el.getElementsByTagNameNS("*", tagName).getLength() > 0) return true;
+        return el.getElementsByTagName(tagName).getLength() > 0;
     }
 
     /**
@@ -652,15 +830,19 @@ public class DxlProcessor {
         private final String  type;
         private final String  name;
         private final boolean java;
+        private final boolean ghost;
         private final String  excludedReason;
+        private final String  language;
         private final String  cleanDxl;
 
-        DesignElement(String type, String name, boolean java,
-                      String excludedReason, String cleanDxl) {
+        DesignElement(String type, String name, boolean java, boolean ghost,
+                      String excludedReason, String language, String cleanDxl) {
             this.type           = type;
             this.name           = name;
             this.java           = java;
+            this.ghost          = ghost;
             this.excludedReason = excludedReason;
+            this.language       = language;
             this.cleanDxl       = cleanDxl;
         }
 
@@ -680,6 +862,14 @@ public class DxlProcessor {
         public boolean isJava() { return java; }
 
         /**
+         * {@code true} when this element is a ghost note &mdash; an empty
+         * deletion-stub note left behind in the source database with no name
+         * and no payload. Callers should skip writing it to disk; see
+         * {@link DxlProcessor#isGhostElement(Element)} for the precise rule.
+         */
+        public boolean isGhost() { return ghost; }
+
+        /**
          * {@code true} when this element has been flagged for exclusion from the
          * design export — e.g. a per-user private replication formula or an
          * XPages build artifact. Callers should skip writing it to disk.
@@ -691,6 +881,17 @@ public class DxlProcessor {
          * {@code null} when {@link #isExcluded()} is {@code false}.
          */
         public String getExcludedReason() { return excludedReason; }
+
+        /**
+         * The coding language/kind of this element:
+         * {@code "java"} (source present in Designer),
+         * {@code "imported_java"} (JAR-only, no editable source),
+         * {@code "lotusscript"}, {@code "javascript"}, {@code "ssjs"},
+         * {@code "formula"}, {@code "simple"},
+         * or {@code null} when not applicable or undetermined.
+         * Meaningful only for {@code agent} and {@code scriptlibrary} elements.
+         */
+        public String getLanguage() { return language; }
 
         /** Cleaned DXL XML string ready to write to a {@code .dxl} file. */
         public String getCleanDxl() { return cleanDxl; }
