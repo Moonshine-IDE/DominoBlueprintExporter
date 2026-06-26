@@ -163,6 +163,7 @@ public class DxlProcessor {
                 put("dataconnectionresource", "DataConnection");
                 put("replicationformula",     "ReplicationFormula");
                 put("databaseprofile",        "Profile");
+                put("launchsettings",         "LaunchSettings");
                 // Generic <note class="X"> values that DxlExporter uses instead of
                 // dedicated tags for certain element kinds
                 put("icon",                   "DatabaseIcon");

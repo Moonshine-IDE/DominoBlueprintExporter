@@ -93,6 +93,16 @@ public class DesignExporter {
     private final File outputDir;
 
     /**
+     * The database-level {@code <launchsettings>} block (Notes/Web launch
+     * options) rides along in the {@code <database>} wrapper of EVERY
+     * category's DXL export. It is legitimate design, but must be written
+     * exactly once — {@link #exportOther()} owns it, and every other category
+     * skips it via this set to avoid six duplicate copies.
+     */
+    private static final Set<String> SKIP_LAUNCH_SETTINGS =
+            Collections.singleton("launchsettings");
+
+    /**
      * Create an exporter for the given database.
      *
      * @param session   Active Domino session
@@ -153,7 +163,7 @@ public class DesignExporter {
         routes.put("subform",     subformsDir);
         routes.put("sharedfield", sharedFldsDir);
 
-        exportCollection(nc, formsDir, /* skipJava= */ false, routes, null);
+        exportCollection(nc, formsDir, /* skipJava= */ false, routes, SKIP_LAUNCH_SETTINGS);
         nc.recycle();
     }
 
@@ -185,7 +195,7 @@ public class DesignExporter {
         Map<String, File> routes = new HashMap<>();
         routes.put("sharedcolumn", columnsDir);   // defensive — see Javadoc
 
-        exportCollection(nc, viewsDir, /* skipJava= */ false, routes, null);
+        exportCollection(nc, viewsDir, /* skipJava= */ false, routes, SKIP_LAUNCH_SETTINGS);
         nc.recycle();
     }
 
@@ -245,7 +255,7 @@ public class DesignExporter {
         suppressSuffix.add("agent");
         suppressSuffix.add("scriptlibrary");
 
-        exportCollection(nc, codeDir, /* skipJava= */ false, null, null,
+        exportCollection(nc, codeDir, /* skipJava= */ false, null, SKIP_LAUNCH_SETTINGS,
                          languageRoutes, suppressSuffix);
         nc.recycle();
     }
@@ -270,7 +280,7 @@ public class DesignExporter {
         nc.setSelectMiscFormatElements(true);  // file resources, applet resources
         nc.buildCollection();
 
-        exportCollection(nc, dir, /* skipJava= */ true, null, null);
+        exportCollection(nc, dir, /* skipJava= */ true, null, SKIP_LAUNCH_SETTINGS);
         nc.recycle();
     }
 
@@ -288,7 +298,7 @@ public class DesignExporter {
         nc.setSelectNavigators(true);
         nc.buildCollection();
 
-        exportCollection(nc, dir, /* skipJava= */ false, null, null);
+        exportCollection(nc, dir, /* skipJava= */ false, null, SKIP_LAUNCH_SETTINGS);
         nc.recycle();
     }
 
@@ -340,7 +350,9 @@ public class DesignExporter {
         // Subforms / shared fields can leak into the "misc" buckets above; they
         // were already written to shared/ by exportForms(), so skip them here
         // to prevent duplicates. Shared columns are intentionally NOT skipped
-        // — this method is where they are produced.
+        // — this method is where they are produced. The database-level
+        // <launchsettings> block is likewise NOT skipped: this is the one
+        // category that keeps it (written once to other/LaunchSettings.dxl).
         Set<String> skipTypes = new HashSet<>();
         skipTypes.add("subform");
         skipTypes.add("sharedfield");
@@ -402,9 +414,13 @@ public class DesignExporter {
 
         for (DxlProcessor.DesignElement element : elements) {
             if (!"acl".equalsIgnoreCase(element.getType())) {
-                System.out.println("  [SKIP unexpected " + element.getType()
-                        + "] in ACL export");
-                skippedOther++;
+                // <launchsettings> rides along in every export wrapper; it is
+                // expected here (and owned by exportOther), so skip it quietly.
+                if (!"launchsettings".equalsIgnoreCase(element.getType())) {
+                    System.out.println("  [SKIP unexpected " + element.getType()
+                            + "] in ACL export");
+                    skippedOther++;
+                }
                 continue;
             }
             aclSeen++;
