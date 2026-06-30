@@ -54,7 +54,7 @@ import java.util.Set;
  *
  * <p>The output matches the format used by the manually-exported example files
  * in the project (e.g. {@code HelloWorld.dxl}) and is compatible with
- * {@code java -jar DXLImport.jar}.
+ * the {@code import} subcommand ({@code java -jar DominoBlueprint.jar import ...}).
  */
 public class DxlProcessor {
 

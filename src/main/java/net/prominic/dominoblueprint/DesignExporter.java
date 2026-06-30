@@ -84,7 +84,8 @@ import java.util.Set;
  * {@code path}, {@code title}, etc.) and note metadata ({@code <noteinfo>},
  * {@code <updatedby>}, {@code <wassignedby>}) are removed so the files can be
  * imported cleanly into a fresh database with
- * {@code java -jar DXLImport.jar <server> <database> <file.dxl>}.
+ * the {@code import} subcommand
+ * ({@code java -jar DominoBlueprint.jar import -d <database> -i <file-or-directory>}).
  */
 public class DesignExporter {
 

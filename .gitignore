@@ -16,6 +16,7 @@ gradle.properties
 # OS noise
 .DS_Store
 Thumbs.db
+*.swp
 
 # Runtime export output (not part of the source distribution)
 export/

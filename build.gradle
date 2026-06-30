@@ -2,11 +2,11 @@ plugins {
     id 'java'
     id 'application'  // enables the 'run' task and distribution packaging
     id 'eclipse'      // allows dependencies to be exported to .classpath
-    id 'com.github.johnrengelman.shadow' version '7.1.2'  // fat JAR – bundles Domino JARs
+    id 'com.github.johnrengelman.shadow' version '7.1.2'  // fat JAR (Domino JARs excluded – see below)
 }
 
-archivesBaseName = 'DominoBlueprintExporter'
-mainClassName = 'net.prominic.dominoblueprint.DominoBlueprintExporter'
+archivesBaseName = 'DominoBlueprint'
+mainClassName = 'net.prominic.dominoblueprint.DominoBlueprint'
 
 repositories {
     mavenCentral()
@@ -60,14 +60,59 @@ String findFile(String baseDir, String findName) {
     return foundFile
 }
 
-String notesJarPath = findFile(notesJarBaseDir, 'Notes.jar')
-// Required: web-service support classes used by DxlExporter at runtime
-// (lotus.domino.websvc.*, lotus.domino.axis.*, lotus.domino.ws.*)
-// DXLImporter-Gradle-Demo uses this same JAR for the same reason.
-String webSvcJarPath = findFile(notesJarBaseDir, 'websvc.jar')
-// Domino 12.0.2+ NAPI JARs (optional – present in newer installs)
-String napiJarPath  = findFile(notesJarBaseDir, 'lwpd.domino.napi.jar')
-String lwpdJarPath  = findFile(notesJarBaseDir, 'lwpd.commons.jar')
+// ---------------------------------------------------------------------------
+// Resolve the licensed HCL Domino JARs once.
+//
+// These JARs are required to COMPILE and RUN, but must NOT be bundled into the
+// distributed artifact (they are licensed HCL JARs that should not travel
+// between systems).  The same detected paths feed both the compileOnly
+// dependencies (below) and the executable-jar manifest Class-Path, so the jar
+// finds them at runtime without being shipped inside it.
+//
+//   - Notes.jar             : required (core Domino classes)
+//   - websvc.jar            : required – the native DxlExporter.NexportDxl() /
+//                             DxlImporter.NimportDxl() load lotus.domino.websvc.* /
+//                             axis.* / ws.* when handling agents and script libraries
+//   - lwpd.domino.napi.jar  : optional (present in Domino 12.0.2+ installs)
+//   - lwpd.commons.jar      : optional (present in Domino 12.0.2+ installs)
+// ---------------------------------------------------------------------------
+
+List<String> dominoJarNames = ['Notes.jar', 'lwpd.domino.napi.jar', 'lwpd.commons.jar', 'websvc.jar']
+Map<String, String> dominoJarPaths = [:]
+dominoJarNames.each { String jarName ->
+    String found = findFile(notesJarBaseDir, jarName)
+    dominoJarPaths[jarName] = found
+    if (!found) {
+        logger.warn "Domino JAR '$jarName' not found under '$notesJarBaseDir'; it will be omitted from the manifest Class-Path."
+    }
+}
+
+if (!dominoJarPaths['Notes.jar']) {
+    throw new GradleException("Required 'Notes.jar' not found under '$notesJarBaseDir'. Check notesInstallation in gradle.properties.")
+}
+if (!dominoJarPaths['websvc.jar']) {
+    logger.warn "'websvc.jar' not found – exporting/importing Java agents or script libraries will fail at runtime (native code loads lotus.domino.websvc.* / axis.* / ws.*)."
+}
+
+// Encode an absolute path for a manifest Class-Path entry: spaces -> %20, and prefix a leading
+// Windows drive letter (e.g. C:) with '/' so it forms a valid file reference.
+Closure<String> manifestEntry = { String path -> path.replaceAll(' ', '%20').replaceAll('^\\w+:', '/$0') }
+
+// For each Domino JAR, list it both alongside the executable jar (./name, e.g. when copied for
+// deployment) and at its detected absolute location, so the jar runs whether the Domino JARs sit
+// next to it or only in the installation directory.
+List<String> classPathEntries = []
+dominoJarNames.each { String jarName ->
+    classPathEntries << "./$jarName"
+    if (dominoJarPaths[jarName]) {
+        classPathEntries << manifestEntry(dominoJarPaths[jarName])
+    }
+}
+String jarClassPath = classPathEntries.join(' ')
+
+// Domino JARs as a FileCollection, for the dev JavaExec tasks below (compileOnly deps are not on
+// the runtime classpath, so they must be added back explicitly to actually run from Gradle).
+FileCollection dominoRuntimeFiles = files(dominoJarPaths.values().findAll { it != null })
 
 // ---------------------------------------------------------------------------
 // Java compatibility
@@ -78,41 +123,43 @@ targetCompatibility = 1.8
 
 // ---------------------------------------------------------------------------
 // Dependencies
+//
+// The Domino JARs are declared compileOnly so they are available on the compile
+// classpath but are NOT placed on the runtime configuration that Shadow bundles.
+// This keeps the licensed JARs out of the distributed fat jar; they are supplied
+// at runtime via the manifest Class-Path (jarClassPath) instead.
 // ---------------------------------------------------------------------------
 
 dependencies {
-    implementation files("$notesJarPath")
-    // websvc.jar must be bundled: DxlExporter.NexportDxl() (native method) tries
-    // to load lotus.domino.websvc.*, lotus.domino.axis.*, and lotus.domino.ws.*
-    // classes at runtime whenever it encounters agents or script libraries.
-    // Without it the export throws NoClassDefFoundError and aborts mid-collection.
-    if (webSvcJarPath) implementation files("$webSvcJarPath")
-    if (napiJarPath)   implementation files("$napiJarPath")
-    if (lwpdJarPath)   implementation files("$lwpdJarPath")
+    compileOnly files(dominoJarPaths['Notes.jar'])
+    if (dominoJarPaths['websvc.jar'])           compileOnly files(dominoJarPaths['websvc.jar'])
+    if (dominoJarPaths['lwpd.domino.napi.jar']) compileOnly files(dominoJarPaths['lwpd.domino.napi.jar'])
+    if (dominoJarPaths['lwpd.commons.jar'])     compileOnly files(dominoJarPaths['lwpd.commons.jar'])
 }
 
 // ---------------------------------------------------------------------------
 // Fat JAR – produced by the Shadow plugin
 //
-// Bundles Notes.jar and the other Domino JARs directly into DXLExporter.jar
-// so the JAR is self-contained at the Java level.  The Domino *native*
-// libraries (.so / .dylib / .dll) still need to be accessible at runtime via
-// LD_LIBRARY_PATH / DYLD_LIBRARY_PATH – use run.sh which handles this
-// automatically, or set the variable yourself before calling java -jar.
+// Bundles the project's own classes (and any non-Domino runtime deps).  The
+// licensed Domino JARs are intentionally EXCLUDED (declared compileOnly above)
+// and supplied at runtime via the manifest Class-Path: each JAR is listed both
+// as ./<name> (when copied next to the jar) and at its detected absolute install
+// location.  The Domino *native* libraries (.so / .dylib / .dll) still need to be
+// on LD_LIBRARY_PATH / DYLD_LIBRARY_PATH – use run.sh, which handles this.
 //
 // Build:  gradle shadowJar   (or simply: gradle build)
-// Run:    java -jar build/libs/DominoBlueprintExporter.jar <server> <database> [outputDir]
+// Run:    java -jar build/libs/DominoBlueprint.jar <export|createdb|import> [options]
 // ---------------------------------------------------------------------------
 
-// Disable the thin jar – we only want the fat jar
+// Disable the thin jar – we only want the (shaded) fat jar
 jar.enabled = false
 
 shadowJar {
-    archiveFileName = 'DominoBlueprintExporter.jar'   // keep the same name regardless of version
+    archiveFileName = 'DominoBlueprint.jar'   // keep the same name regardless of version
 
     manifest {
-        attributes 'Main-Class': mainClassName
-        // No Class-Path needed – everything is bundled inside
+        attributes 'Main-Class': mainClassName,
+                   'Class-Path': jarClassPath   // licensed Domino JARs supplied at runtime, not bundled
     }
 
     mergeServiceFiles()   // handle duplicate META-INF/services across bundled JARs
@@ -122,69 +169,90 @@ shadowJar {
 assemble.dependsOn shadowJar
 
 // ---------------------------------------------------------------------------
-// runExporter – convenience Gradle task for development / CI
+// Convenience Gradle tasks for development / CI
 //
-// All argument validation and assembly is deferred to doFirst{} so that
-// other tasks (e.g. 'jar', 'clean') are never affected by missing -P flags.
+// One task per subcommand, each dispatching through the single DominoBlueprint
+// entry point.  All argument validation/assembly is deferred to doFirst{} so
+// other tasks (e.g. 'clean', 'shadowJar') are never affected by missing -P flags.
 //
-// Usage:
-//   gradle -PnotesInstallation=<path> \
-//          -PnotesIDPassword=<password> \
-//          -Pserver=<server> \
-//          -PdbName=<database.nsf> \
-//          [-PoutputDir=./export] \
-//          runExporter
+//   runExporter  – export  (-Pserver -PdbName -PoutputDir)
+//   runCreateDb  – createdb (-Pserver -PdbName)
+//   runImport    – import  (-Pserver -PdbName -PdxlInput [-PaclImport])
 //
-// Produces: build/libs/DominoBlueprintExporter.jar
+// Password: -PnotesIDPassword=<pw> OR the PASSWORD environment variable.
 // ---------------------------------------------------------------------------
 
-task runExporter(type: JavaExec, dependsOn: classes) {
-    classpath = sourceSets.main.runtimeClasspath
-    mainClass = mainClassName
+// Apply a Notes ID password to a JavaExec task via the PASSWORD env var and stdin
+// (Domino's native password reader reads stdin before our Java runs).
+Closure applyPassword = { JavaExec task ->
+    String notesIDPassword = task.project.findProperty('notesIDPassword') ?: System.getenv('PASSWORD') ?: ''
+    if (notesIDPassword) {
+        task.environment('PASSWORD', notesIDPassword)
+        task.standardInput = new java.io.ByteArrayInputStream("${notesIDPassword}\n".getBytes('UTF-8'))
+    } else {
+        task.standardInput = new java.io.ByteArrayInputStream("".getBytes('UTF-8'))
+    }
+}
 
-    // Domino native library path (macOS: DYLD_LIBRARY_PATH; Linux: LD_LIBRARY_PATH)
+task runExporter(type: JavaExec, dependsOn: classes) {
+    // compileOnly Domino JARs are not on runtimeClasspath, so add them back to actually run.
+    classpath = sourceSets.main.runtimeClasspath + dominoRuntimeFiles
+    mainClass = mainClassName
     environment('DYLD_LIBRARY_PATH', notesInstallation)
     environment('LD_LIBRARY_PATH',   notesInstallation)
     environment('PATH', envPath)
-
-    // Redirect stderr to stdout for clearer output in CI logs
     errorOutput = System.out
-
-    // -----------------------------------------------------------------------
-    // Everything below runs only when this specific task is executed,
-    // NOT during configuration of the whole build.
-    // -----------------------------------------------------------------------
     doFirst {
-        String server      = project.findProperty('server')    ?: ''
-        String dbName      = project.findProperty('dbName')    ?: ''
-        String outputDir   = project.findProperty('outputDir') ?: './export'
-
-        // Accept the password from -PnotesIDPassword=<pw> OR from the PASSWORD
-        // environment variable already set in the shell.  Interactive prompting
-        // is not possible in Gradle (no real TTY), so one of these two must be set.
-        String notesIDPassword = project.findProperty('notesIDPassword')
-                              ?: System.getenv('PASSWORD')
-                              ?: ''
-
+        String server    = project.findProperty('server')    ?: ''
+        String dbName    = project.findProperty('dbName')    ?: ''
+        String outputDir = project.findProperty('outputDir') ?: './export'
         if (!dbName) {
-            throw new GradleException(
-                "Database name is required.  Add -PdbName=<database.nsf> to your Gradle command.")
+            throw new GradleException("Database name is required.  Add -PdbName=<database.nsf>.")
         }
+        applyPassword(delegate)
+        args 'export', '--server', server, '--database', dbName, '--output', outputDir
+    }
+}
 
-        if (notesIDPassword) {
-            // 1. Expose via PASSWORD env var so our Java code picks it up silently
-            //    (avoids the "shell history" warning that the --password flag triggers).
-            environment('PASSWORD', notesIDPassword)
-            // 2. Also feed via stdin for Domino's *native* password reader, which
-            //    reads directly from the process stdin stream before our Java code runs.
-            standardInput = new java.io.StringBufferInputStream("${notesIDPassword}\n\u001B")
-        } else {
-            // No password supplied – send Esc to dismiss any unexpected native prompt.
-            standardInput = new java.io.StringBufferInputStream("\u001B")
+task runCreateDb(type: JavaExec, dependsOn: classes) {
+    classpath = sourceSets.main.runtimeClasspath + dominoRuntimeFiles
+    mainClass = mainClassName
+    environment('DYLD_LIBRARY_PATH', notesInstallation)
+    environment('LD_LIBRARY_PATH',   notesInstallation)
+    environment('PATH', envPath)
+    errorOutput = System.out
+    doFirst {
+        String server = project.findProperty('server') ?: ''
+        String dbName = project.findProperty('dbName') ?: ''
+        if (!dbName) {
+            throw new GradleException("Database name is required.  Add -PdbName=<database.nsf>.")
         }
+        applyPassword(delegate)
+        args 'createdb', '--server', server, '--database', dbName
+    }
+}
 
-        args '--server', server, '--database', dbName, '--output', outputDir
-        // Note: we deliberately do NOT pass --password here; the PASSWORD env var
-        // set above is sufficient and avoids printing a shell-history warning.
+task runImport(type: JavaExec, dependsOn: classes) {
+    classpath = sourceSets.main.runtimeClasspath + dominoRuntimeFiles
+    mainClass = mainClassName
+    environment('DYLD_LIBRARY_PATH', notesInstallation)
+    environment('LD_LIBRARY_PATH',   notesInstallation)
+    environment('PATH', envPath)
+    errorOutput = System.out
+    doFirst {
+        String server   = project.findProperty('server')   ?: ''
+        String dbName   = project.findProperty('dbName')   ?: ''
+        String dxlInput = project.findProperty('dxlInput') ?: ''
+        String aclMode  = project.findProperty('aclImport') ?: ''
+        if (!dbName) {
+            throw new GradleException("Database name is required.  Add -PdbName=<database.nsf>.")
+        }
+        if (!dxlInput) {
+            throw new GradleException("Import source is required.  Add -PdxlInput=<dxl-file-or-directory>.")
+        }
+        applyPassword(delegate)
+        List<String> a = ['import', '--server', server, '--database', dbName, '--input', dxlInput]
+        if (aclMode) { a << "--acl-import=${aclMode}".toString() }
+        args(a as Object[])
     }
 }

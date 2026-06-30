@@ -1,8 +1,29 @@
-# DominoBlueprint Exporter
+# DominoBlueprint
 
-A Gradle-based Java command-line tool that exports HCL Domino design elements
-from an existing database so they can be imported into a fresh copy with
-[`DXLImport.jar`](../DXLImporter-Gradle-Demo/).
+A Gradle-based Java command-line toolkit for the HCL Domino design round-trip.
+A single `DominoBlueprint.jar` exposes three subcommands:
+
+- `export`   – export a database's design to a tree of DXL files
+- `createdb` – create a blank target database (no views) ready for an import
+- `import`   – import a DXL file, or a full blueprint tree, into a database
+
+```bash
+java -jar DominoBlueprint.jar export   -d apps/mydb.nsf -o ./export
+java -jar DominoBlueprint.jar createdb -d apps/restored.nsf
+java -jar DominoBlueprint.jar import   -d apps/restored.nsf -i ./export
+```
+
+All subcommands share the same flags (`-s/--server`, `-d/--database`,
+`-p/--password`) and the same password resolution; run
+`java -jar DominoBlueprint.jar <subcommand> --help` for the per-subcommand options.
+
+## Requirements
+
+| Dependency | Version | Notes |
+|------------|---------|-------|
+| JDK | **8** | The build targets Java 8 (`sourceCompatibility`/`targetCompatibility = 1.8`) and must be compiled with JDK 8 until HCL updates the Domino API for newer Java releases. |
+| Gradle | **7.5.1** | Use the bundled wrapper (`./gradlew`), which pins this version. Newer Gradle (8.x / 9.x) is **not** supported by the current build (Shadow plugin 7.1.2 and the `archivesBaseName` / `mainClassName` conventions). |
+| HCL Notes / Domino | installed locally | Needed to compile against `Notes.jar`; set `notesInstallation` in `gradle.properties`. The licensed Domino JARs are **not** bundled (see Building). |
 
 ## Output structure
 
@@ -22,23 +43,22 @@ from an existing database so they can be imported into a fresh copy with
   other/              – database script, database icon, Help About / Help Using,
                         data connections, replication formulas, profile documents,
                         and anything else classified as misc design
+  acl/                – database ACL (acl.dxl), applied on import per --acl-import
 ```
 
 Together these directories represent the full database **design** &mdash;
-importing every file back into an empty database with `DXLImport.jar`
-reproduces the original design. The ACL is **not** exported here and is
-handled by a separate tool.
+importing the tree back into an empty database with the `import` subcommand
+reproduces the original design.
 
 Each file is cleaned before being written:
 - Database-replica attributes (`replicaid`, `path`, `title`, etc.) are removed
 - `<databaseinfo>` is removed
 - Note metadata (`<noteinfo>`, `<updatedby>`, `<wassignedby>`) is removed
 
-The resulting files match the format of `dxl/HelloWorld.dxl` in the importer
-project and can be imported directly with:
+The resulting files can be imported directly with:
 
 ```bash
-java -jar DXLImport.jar <server> <database> <file.dxl>
+java -jar DominoBlueprint.jar import -d <database> -i <file-or-directory>
 ```
 
 ### Anything Java is excluded
@@ -51,21 +71,23 @@ Java code separately using the Gradle build in `DXLImporter-Gradle-Demo/`.
 ## Building
 
 The only build-time requirement is Notes/Domino on the build machine
-(needed to compile against `Notes.jar`).  The output is a **fat JAR** —
-`Notes.jar` and the other Domino JARs are bundled inside, so the JAR is
-self-contained at the Java level.  The Domino *native* libraries still need to
-be on `LD_LIBRARY_PATH` at runtime (see deployment options below).
+(needed to compile against `Notes.jar`).  The licensed HCL Domino JARs
+(`Notes.jar`, `websvc.jar`, `lwpd.*`) are **not** bundled into the jar — they
+are supplied at runtime via the jar's manifest `Class-Path`, which lists each
+JAR both at its detected absolute install path and as `./<name>`.  The Domino
+*native* libraries still need to be on `LD_LIBRARY_PATH` at runtime (see
+deployment options below).
 
 ```bash
 cp gradle.properties.example gradle.properties
 # edit gradle.properties → set notesInstallation for your platform
 
-gradle shadowJar          # or: gradle build
-# → build/libs/DominoBlueprintExporter.jar  (fat JAR, ~30 MB)
+./gradlew shadowJar       # or: ./gradlew build
+# → build/libs/DominoBlueprint.jar
 ```
 
-`gradle shadowJar` never requires `-PdbName` or any other runtime flag —
-those are only needed by the `runExporter` Gradle task.
+`./gradlew shadowJar` never requires `-PdbName` or any other runtime flag —
+those are only needed by the `runExporter` / `runCreateDb` / `runImport` tasks.
 
 ## Password
 
@@ -82,45 +104,46 @@ plaintext on the command line unless you choose to:
 ## Running via Gradle (same machine as Notes)
 
 Gradle has no real TTY, so interactive password prompting is not possible.
-The password **must** be supplied via one of these two methods:
+The password **must** be supplied via `-PnotesIDPassword` or the `PASSWORD`
+environment variable (or omitted entirely if the ID has no password).
 
 ```bash
-# Option A: -PnotesIDPassword flag
-gradle -PnotesInstallation=/Applications/HCL\ Notes.app/Contents/MacOS/ \
-       -PnotesIDPassword=secret \
-       -Pserver="myserver/Org" \
-       -PdbName=apps/mydb.nsf \
-       -PoutputDir=./export \
-       runExporter
-
-# Option B: PASSWORD environment variable (keeps credentials out of the command line)
-PASSWORD=secret gradle \
+# export
+PASSWORD=secret ./gradlew \
        -PnotesInstallation=/Applications/HCL\ Notes.app/Contents/MacOS/ \
        -Pserver="myserver/Org" \
        -PdbName=apps/mydb.nsf \
        -PoutputDir=./export \
        runExporter
-```
 
-If the Notes ID has no password, omit both — the task will still work.
+# createdb (blank target database)
+PASSWORD=secret ./gradlew -Pserver="myserver/Org" -PdbName=apps/restored.nsf runCreateDb
+
+# import a blueprint tree (optionally -PaclImport=<mode>)
+PASSWORD=secret ./gradlew -Pserver="myserver/Org" -PdbName=apps/restored.nsf \
+       -PdxlInput=./export runImport
+```
 
 ## Deploying to a Linux Domino server
 
-The JAR is plain Java bytecode — build it once on any platform and copy it
-to the target server.  There are no Maven/external dependencies to bundle;
-the only runtime requirement is the Domino JARs already present on the server.
+The jar contains only this project's own bytecode; the licensed Domino JARs are
+resolved at runtime via the manifest `Class-Path`.  That `Class-Path` bakes in
+the **absolute** Domino install path detected on the *build* machine, plus a
+relative `./<name>` entry for each JAR.  So when deploying to a different
+machine, place `DominoBlueprint.jar` next to the Domino JARs (Option B) so the
+`./<name>` entries resolve — or rebuild on the target server.
 
 ### Option A — `run.sh` (recommended)
 
 `run.sh` auto-discovers the Domino installation and sets `LD_LIBRARY_PATH`:
 
 ```bash
-# Copy both files to the server
-scp build/libs/DominoBlueprintExporter.jar run.sh user@domino-server:/local/notesjava/
+# Copy both files to the server (place next to the Domino JARs so Class-Path resolves)
+scp build/libs/DominoBlueprint.jar run.sh user@domino-server:/local/notesjava/
 
 # On the server
 chmod +x /local/notesjava/run.sh
-PASSWORD=secret /local/notesjava/run.sh "myserver/Org" apps/mydb.nsf ./export
+PASSWORD=secret /local/notesjava/run.sh export -s "myserver/Org" -d apps/mydb.nsf -o ./export
 ```
 
 If Domino is in a non-standard location, set `DOMINO_INSTALL`:
@@ -128,63 +151,51 @@ If Domino is in a non-standard location, set `DOMINO_INSTALL`:
 ```bash
 DOMINO_INSTALL=/opt/hcl/domino/notes/12.0.2/linux \
 PASSWORD=secret \
-/local/notesjava/run.sh "myserver/Org" apps/mydb.nsf ./export
+/local/notesjava/run.sh export -s "myserver/Org" -d apps/mydb.nsf -o ./export
 ```
 
-### Option B — alongside Notes.jar (same pattern as DXLImport.jar)
+### Option B — alongside the Domino JARs
 
-Place `DominoBlueprintExporter.jar` in the same directory as the Domino JARs:
+Place `DominoBlueprint.jar` in the same directory as `Notes.jar` so the
+`./<name>` Class-Path entries resolve:
 
 ```bash
-cp build/libs/DominoBlueprintExporter.jar /local/notesjava/   # Notes.jar already lives here
+cp build/libs/DominoBlueprint.jar /local/notesjava/   # Notes.jar already lives here
 
-# Identical invocation pattern to DXLImport.jar
-PASSWORD=password java -jar /local/notesjava/DominoBlueprintExporter.jar \
-    $SERVER $DATABASE ./export 2>&1
+PASSWORD=password java -jar /local/notesjava/DominoBlueprint.jar \
+    export -s "$SERVER" -d "$DATABASE" -o ./export 2>&1
 ```
 
 ### Option C — explicit classpath
 
 ```bash
 DOMINO=/opt/hcl/domino/notes/latest/linux
-java -cp /local/notesjava/DominoBlueprintExporter.jar:$DOMINO/Notes.jar \
+java -cp /local/notesjava/DominoBlueprint.jar:$DOMINO/Notes.jar \
      -Djava.library.path=$DOMINO \
-     net.prominic.dominoblueprint.DominoBlueprintExporter \
-     "$SERVER" "$DATABASE" ./export
+     net.prominic.dominoblueprint.DominoBlueprint \
+     export -s "$SERVER" -d "$DATABASE" -o ./export
 ```
 
 ## GitHub Actions integration
 
-Add an export step before your `Import` steps. Because `DXLImport.jar` accepts
-a directory and walks it recursively, you can import the entire export tree in
-one invocation:
+Because the `import` subcommand accepts a directory and walks it recursively,
+you can export and re-import an entire design tree in one invocation each:
 
 ```yaml
 - name: Export design elements
   run: |
-    PASSWORD=password java \
-        -jar /local/notesjava/DominoBlueprintExporter.jar \
-        $SERVER $SOURCE_DATABASE ./export 2>&1
+    PASSWORD=password java -jar /local/notesjava/DominoBlueprint.jar \
+        export -s "$SERVER" -d "$SOURCE_DATABASE" -o ./export 2>&1
+
+- name: Create the target database
+  run: |
+    PASSWORD=password java -jar /local/notesjava/DominoBlueprint.jar \
+        createdb -s "$SERVER" -d "$TARGET_DATABASE" 2>&1
 
 - name: Import the full design
   run: |
-    PASSWORD=password java -jar /local/notesjava/DXLImport.jar \
-        $SERVER $TARGET_DATABASE ./export 2>&1
-```
-
-If you prefer per-category control, import each directory in order &mdash; forms
-first so views/code/resources/pages can reference them:
-
-```yaml
-- name: Import design by category
-  run: |
-    for dir in forms views code resources pages other; do
-      for f in ./export/$dir/*.dxl; do
-        [ -f "$f" ] || continue
-        PASSWORD=password java -jar /local/notesjava/DXLImport.jar \
-            $SERVER $TARGET_DATABASE "$f" 2>&1
-      done
-    done
+    PASSWORD=password java -jar /local/notesjava/DominoBlueprint.jar \
+        import -s "$SERVER" -d "$TARGET_DATABASE" -i ./export 2>&1
 ```
 
 ## Design note: excluded Java code
@@ -266,15 +277,18 @@ handled by a separate utility.
 ## Project structure
 
 ```
-DominoBlueprintExporter/
-├── build.gradle                    Gradle build (mirrors DXLImporter-Gradle-Demo)
+DominoBlueprint/
+├── build.gradle                    Gradle build (Shadow jar; Domino JARs via Class-Path)
 ├── gradle.properties.example       Template – copy to gradle.properties
-├── run.sh                          Linux launcher – discovers Domino JARs automatically
+├── run.sh                          Linux launcher – discovers Domino native libs automatically
 ├── LICENSE.md                      Server Side Public License v1
 ├── src/main/java/net/prominic/dominoblueprint/
-│   ├── DominoBlueprintExporter.java  CLI entry point & argument parsing
-│   ├── DesignExporter.java           Export orchestrator
-│   │                                 (forms / views / code / resources / pages / other)
-│   └── DxlProcessor.java             XML split, clean, and Java detection
+│   ├── DominoBlueprint.java         CLI entry point – subcommand dispatch, auth, session
+│   ├── DominoBlueprintExporter.java Export work method
+│   ├── DominoBlueprintImport.java   Import work methods (single file + recursive tree)
+│   ├── CreateDatabase.java          Create a blank target database (no default view)
+│   ├── DesignExporter.java          Export orchestrator
+│   │                                (forms / views / code / resources / pages / other)
+│   └── DxlProcessor.java            XML split, clean, and Java detection
 └── README.md
 ```
