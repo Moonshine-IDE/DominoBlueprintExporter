@@ -39,6 +39,13 @@ import java.util.Set;
  *             on the root {@code <database>} element</li>
  *         <li>{@code <noteinfo>}, {@code <updatedby>}, {@code <wassignedby>} children
  *             of each design element</li>
+ *         <li>{@code <rundata>}, {@code <runlog>}, {@code <designchange>} children
+ *             of each design element — agent run history / modified-timestamp
+ *             noise a freshly imported copy has not accumulated yet</li>
+ *         <li>{@code <item name="$DesignerBuild">} — a Designer-applied build
+ *             stamp, not source design content</li>
+ *         <li>Empty {@code <code event="declarations"><lotusscript/></code>} blocks
+ *             — Domino does not re-emit an empty declarations event on import</li>
  *       </ul>
  *   </li>
  *   <li><b>Detect Java</b> – an element is flagged as Java code when its own tag
@@ -102,7 +109,23 @@ public class DxlProcessor {
      * </ul>
      */
     private static final Set<String> NOTE_CHILDREN_TO_REMOVE = new HashSet<>(Arrays.asList(
-            "noteinfo", "updatedby", "wassignedby", "logentry"
+            "noteinfo", "updatedby", "wassignedby", "logentry",
+            "rundata", "runlog", "designchange"
+    ));
+
+    /**
+     * {@code <item>} names that are Designer-applied stamps rather than portable
+     * design content, and should be stripped from every design element.
+     *
+     * <ul>
+     *   <li>{@code $DesignerBuild} &mdash; the Designer build number that stamped
+     *       the note (e.g. {@code Build V1450_06062025}). Written by Domino on
+     *       import/save; the source element predates it, so it is a guaranteed
+     *       round-trip diff if left in place.</li>
+     * </ul>
+     */
+    private static final Set<String> ITEM_NAMES_TO_REMOVE = new HashSet<>(Arrays.asList(
+            "$DesignerBuild"
     ));
 
     /**
@@ -385,8 +408,15 @@ public class DxlProcessor {
         for (int i = 0; i < children.getLength(); i++) {
             Node child = children.item(i);
             if (child.getNodeType() != Node.ELEMENT_NODE) continue;
-            String tag = localName((Element) child);
+            Element childEl = (Element) child;
+            String  tag     = localName(childEl);
+
             if (NOTE_CHILDREN_TO_REMOVE.contains(tag)) {
+                toRemove.add(child);
+            } else if ("item".equals(tag)
+                    && ITEM_NAMES_TO_REMOVE.contains(childEl.getAttribute("name"))) {
+                toRemove.add(child);
+            } else if (isEmptyDeclarationsCode(childEl, tag)) {
                 toRemove.add(child);
             }
         }
@@ -394,6 +424,38 @@ public class DxlProcessor {
         for (Node node : toRemove) {
             el.removeChild(node);
         }
+    }
+
+    /**
+     * Return {@code true} when {@code childEl} is a
+     * {@code <code event="declarations">} block whose only content is an empty
+     * {@code <lotusscript/>} element (no source text). Domino does not re-emit an
+     * empty declarations event on import, so leaving this block in the export
+     * guarantees a spurious round-trip diff; stripping it here matches what a
+     * fresh import would produce.
+     */
+    private static boolean isEmptyDeclarationsCode(Element childEl, String tag) {
+        if (!"code".equals(tag)) return false;
+        if (!"declarations".equals(childEl.getAttribute("event"))) return false;
+
+        NodeList grand          = childEl.getChildNodes();
+        boolean  sawLotusScript = false;
+        for (int i = 0; i < grand.getLength(); i++) {
+            Node n = grand.item(i);
+            if (n.getNodeType() == Node.TEXT_NODE) {
+                String txt = n.getNodeValue();
+                if (txt != null && !txt.trim().isEmpty()) return false;
+                continue;
+            }
+            if (n.getNodeType() != Node.ELEMENT_NODE) continue;
+
+            Element ge = (Element) n;
+            if (!"lotusscript".equals(localName(ge))) return false; // real content present
+            String text = ge.getTextContent();
+            if (text != null && !text.trim().isEmpty()) return false; // non-empty script
+            sawLotusScript = true;
+        }
+        return sawLotusScript;
     }
 
     /**
@@ -435,12 +497,12 @@ public class DxlProcessor {
      * ghost note. Includes everything the note-metadata cleaner strips
      * ({@link #NOTE_CHILDREN_TO_REMOVE}) plus runtime/state elements Domino
      * emits on every agent regardless of whether the agent has a body
-     * ({@code <designchange>}, {@code <rundata>}, {@code <trigger>},
+     * ({@code <designchange>}, {@code <rundata>}, {@code <runlog>}, {@code <trigger>},
      * {@code <documentset>}, {@code <agentmodified>}).
      */
     private static final Set<String> GHOST_IGNORED_CHILDREN = new HashSet<>(Arrays.asList(
             "noteinfo", "updatedby", "wassignedby", "logentry",
-            "designchange", "rundata", "agentmodified",
+            "designchange", "rundata", "runlog", "agentmodified",
             "trigger", "documentset"
     ));
 
