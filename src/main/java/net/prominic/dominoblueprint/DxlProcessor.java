@@ -34,9 +34,8 @@ import java.util.Set;
  *       is imported into a different (or new) database:
  *       <ul>
  *         <li>{@code <databaseinfo>} element</li>
- *         <li>{@code replicaid}, {@code path}, {@code title}, {@code increasemaxfields},
- *             {@code compressdesign}, {@code compressdata}, {@code uselz1} attributes
- *             on the root {@code <database>} element</li>
+ *         <li>{@code replicaid}, {@code path}, {@code title} attributes on the root
+ *             {@code <database>} element &mdash; source-replica identity, not portable</li>
  *         <li>{@code <noteinfo>}, {@code <updatedby>}, {@code <wassignedby>} children
  *             of each design element</li>
  *         <li>{@code <rundata>}, {@code <runlog>}, {@code <designchange>} children
@@ -69,10 +68,22 @@ public class DxlProcessor {
     // Constants
     // -----------------------------------------------------------------------
 
-    /** Database-level attributes that identify the source replica – must be removed. */
+    /**
+     * Database-level attributes that identify the source replica and must be removed
+     * before re-import.
+     *
+     * <p>{@code increasemaxfields}, {@code compressdesign}, {@code compressdata}, and
+     * {@code uselz1} (Advanced tab: Allow more fields / Compress design / Compress data /
+     * LZ1 compression) used to be stripped here too, on the assumption they were
+     * source-specific like {@code replicaid}/{@code path}. A 2026-07-02 test DB
+     * ({@code TestDominoBlueprintExporter-v3}, Compress design + Compress data toggled on)
+     * confirmed they are real, portable design settings with no other encoding anywhere
+     * in the export (not in {@code $Flags}, not duplicated on the icon note) &mdash; so
+     * they are restored here and now round-trip like the other {@code <database>}
+     * attributes. See item B in {@code DominoBlueprint_RoundTrip_Status.md}.
+     */
     private static final Set<String> DATABASE_ATTRS_TO_REMOVE = new HashSet<>(Arrays.asList(
-            "replicaid", "path", "title",
-            "increasemaxfields", "compressdesign", "compressdata", "uselz1"
+            "replicaid", "path", "title"
     ));
 
     /**
