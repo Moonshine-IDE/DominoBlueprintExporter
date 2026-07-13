@@ -200,9 +200,18 @@ public class DominoBlueprintImport {
      * database.  The database is opened once and reused across all files.
      *
      * <p>Files are imported in alphabetical order of their absolute path to keep runs
-     * reproducible.  If a single file fails to import, the error is logged and the remaining
-     * files are still attempted; at the end, this method throws if any file failed, so the
-     * process exits with a non-zero status.</p>
+     * reproducible, <b>except</b> that any file whose {@code <database>} wrapper declares
+     * database-level properties (see {@link #fileDeclaresDbProperties}) is moved to the end
+     * of the list, preserving their relative order (see {@link #orderDbPropertyFilesLast}).
+     * A DominoBlueprint export has exactly two such files &mdash; {@code acl/acl.dxl} and
+     * {@code other/DatabaseSettings.dxl} &mdash; and today's alphabetical directory naming
+     * (<code>acl/</code> &lt; <code>other/</code>) already happens to import them in that
+     * order, but that's an accident of file naming, not something the code enforces. This
+     * makes it explicit instead. See {@code DominoBlueprint_RoundTrip_Status.md} item B.</p>
+     *
+     * <p>If a single file fails to import, the error is logged and the remaining files are
+     * still attempted; at the end, this method throws if any file failed, so the process
+     * exits with a non-zero status.</p>
      *
      * @param aclImportOption Applied to every file in the directory.  This is intentional:
      *                        {@code acl.dxl} (in {@code acl/}) is the only file in a
@@ -217,8 +226,10 @@ public class DominoBlueprintImport {
 
         List<File> dxlFiles = new ArrayList<File>();
         collectDXLFiles(dxlDir, dxlFiles);
-        // sort by absolute path for reproducible import order
+        // sort by absolute path for reproducible import order, then guarantee the
+        // db-property-bearing files (acl.dxl, DatabaseSettings.dxl) import last
         Collections.sort(dxlFiles);
+        dxlFiles = orderDbPropertyFilesLast(dxlFiles);
 
         System.out.println("Found " + dxlFiles.size() + " DXL file(s) under '" + dxlDir.getAbsolutePath() + "'.");
         if (dxlFiles.isEmpty()) {
@@ -322,7 +333,7 @@ public class DominoBlueprintImport {
      * <p>Bare design-element files (a single {@code <form>}/{@code <view>}/... inside an
      * otherwise-empty {@code <database>} wrapper) return {@code false}, so importing them
      * with {@code setReplaceDbProperties(false)} cannot overwrite database properties that
-     * an earlier file (e.g. {@code other/LaunchSettings.dxl}) just applied.</p>
+     * an earlier file (e.g. {@code other/DatabaseSettings.dxl}) just applied.</p>
      *
      * <p>The relevant block sits at the very top of the file, immediately after the
      * {@code <database>} open tag, so a short prefix is enough to detect it without reading
@@ -351,6 +362,29 @@ public class DominoBlueprintImport {
                 try { in.close(); } catch (Exception ignore) { /* best effort */ }
             }
         }
+    }
+
+    /**
+     * Stable-partition {@code dxlFiles} so that every file for which
+     * {@link #fileDeclaresDbProperties} is {@code true} moves to the end of the list,
+     * preserving the relative order of both groups. See the identical helper (and its full
+     * rationale/NOTE about future order-sensitivity) in the {@code hcl_roles} copy of this
+     * tool, {@code net.prominic.domino.vagrant.DXLImport.orderDbPropertyFilesLast} &mdash;
+     * these two classes are independent, duplicate implementations, and this fix had to be
+     * ported here separately since neither wraps the other.
+     */
+    static List<File> orderDbPropertyFilesLast(List<File> dxlFiles) {
+        List<File> ordinary   = new ArrayList<File>();
+        List<File> dbProperty = new ArrayList<File>();
+        for (File f : dxlFiles) {
+            if (fileDeclaresDbProperties(f)) {
+                dbProperty.add(f);
+            } else {
+                ordinary.add(f);
+            }
+        }
+        ordinary.addAll(dbProperty);
+        return ordinary;
     }
 
     /**

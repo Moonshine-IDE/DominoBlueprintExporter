@@ -79,6 +79,15 @@ import java.util.Set;
  * easy human review &mdash; unlike the other categories, which preserve Domino's
  * compact formatting because they may embed code where whitespace is significant.
  *
+ * <p>Portable database-settings attributes (categories, default language, compress
+ * design/data, soft-deletion interval, etc. &mdash; see
+ * {@code DxlProcessor.DATABASE_SETTINGS_ATTRS}) are stripped from every file's
+ * {@code <database>} wrapper, including {@code acl/acl.dxl}, and kept on exactly one:
+ * {@code other/DatabaseSettings.dxl}, which also carries the {@code <launchsettings>}
+ * block. This avoids duplicating the same values across ~40 files; only
+ * {@code acl/acl.dxl} and {@code other/DatabaseSettings.dxl} are ever imported with
+ * {@code setReplaceDbProperties(true)}.
+ *
  * <p>Each design element is written to its own {@code .dxl} file. The DXL is
  * cleaned before writing: database-specific attributes ({@code replicaid},
  * {@code path}, {@code title}, etc.) and note metadata ({@code <noteinfo>},
@@ -97,10 +106,11 @@ public class DesignExporter {
      * The database-level {@code <launchsettings>} block (Notes/Web launch
      * options) rides along in the {@code <database>} wrapper of EVERY
      * category's DXL export. It is legitimate design, but must be written
-     * exactly once — {@link #exportOther()} owns it, and every other category
-     * skips it via this set to avoid six duplicate copies.
+     * exactly once — {@link #exportOther()} owns it (as {@code other/DatabaseSettings.dxl},
+     * see {@code DxlProcessor.TYPE_SUFFIXES}), and every other category skips it via this
+     * set to avoid six duplicate copies.
      */
-    private static final Set<String> SKIP_LAUNCH_SETTINGS =
+    private static final Set<String> SKIP_DATABASE_SETTINGS =
             Collections.singleton("launchsettings");
 
     /**
@@ -164,7 +174,7 @@ public class DesignExporter {
         routes.put("subform",     subformsDir);
         routes.put("sharedfield", sharedFldsDir);
 
-        exportCollection(nc, formsDir, /* skipJava= */ false, routes, SKIP_LAUNCH_SETTINGS);
+        exportCollection(nc, formsDir, /* skipJava= */ false, routes, SKIP_DATABASE_SETTINGS);
         nc.recycle();
     }
 
@@ -196,7 +206,7 @@ public class DesignExporter {
         Map<String, File> routes = new HashMap<>();
         routes.put("sharedcolumn", columnsDir);   // defensive — see Javadoc
 
-        exportCollection(nc, viewsDir, /* skipJava= */ false, routes, SKIP_LAUNCH_SETTINGS);
+        exportCollection(nc, viewsDir, /* skipJava= */ false, routes, SKIP_DATABASE_SETTINGS);
         nc.recycle();
     }
 
@@ -256,7 +266,7 @@ public class DesignExporter {
         suppressSuffix.add("agent");
         suppressSuffix.add("scriptlibrary");
 
-        exportCollection(nc, codeDir, /* skipJava= */ false, null, SKIP_LAUNCH_SETTINGS,
+        exportCollection(nc, codeDir, /* skipJava= */ false, null, SKIP_DATABASE_SETTINGS,
                          languageRoutes, suppressSuffix);
         nc.recycle();
     }
@@ -281,7 +291,7 @@ public class DesignExporter {
         nc.setSelectMiscFormatElements(true);  // file resources, applet resources
         nc.buildCollection();
 
-        exportCollection(nc, dir, /* skipJava= */ true, null, SKIP_LAUNCH_SETTINGS);
+        exportCollection(nc, dir, /* skipJava= */ true, null, SKIP_DATABASE_SETTINGS);
         nc.recycle();
     }
 
@@ -299,7 +309,7 @@ public class DesignExporter {
         nc.setSelectNavigators(true);
         nc.buildCollection();
 
-        exportCollection(nc, dir, /* skipJava= */ false, null, SKIP_LAUNCH_SETTINGS);
+        exportCollection(nc, dir, /* skipJava= */ false, null, SKIP_DATABASE_SETTINGS);
         nc.recycle();
     }
 
@@ -343,20 +353,42 @@ public class DesignExporter {
         nc.setSelectMiscIndexElements(true);
         nc.buildCollection();
 
+        // Write other/DatabaseSettings.dxl directly from the raw <database> wrapper,
+        // rather than relying on splitElements() surfacing a <launchsettings> design
+        // element for it. Confirmed 2026-07-13: Domino only emits <launchsettings> as a
+        // child of <database> when the Launch tab has some non-default configuration —
+        // a fully-default Launch tab produces no such child at all, which used to mean
+        // no file (and no DATABASE_SETTINGS_ATTRS) got written for this database. See
+        // DxlProcessor.buildDatabaseSettingsDxl() and item B in
+        // DominoBlueprint_RoundTrip_Status.md.
+        DxlExporter settingsExporter = session.createDxlExporter();
+        String      settingsRawDxl   = settingsExporter.exportDxl(nc);
+        settingsExporter.recycle();
+        String   settingsDxl  = DxlProcessor.buildDatabaseSettingsDxl(settingsRawDxl);
+        File     settingsFile = new File(dir, "DatabaseSettings.dxl");
+        try (PrintWriter pw = new PrintWriter(
+                new OutputStreamWriter(new FileOutputStream(settingsFile), "UTF-8"))) {
+            pw.print(settingsDxl);
+        }
+        System.out.println("  Exported: " + relativise(settingsFile) + "  (database settings)");
+
         // Route shared columns out of "other/" and into shared/columns/.
         // setSelectMiscIndexElements(true) above is the source for them.
         Map<String, File> routes = new HashMap<>();
         routes.put("sharedcolumn", columnsDir);
 
         // Subforms / shared fields can leak into the "misc" buckets above; they
-        // were already written to shared/ by exportForms(), so skip them here
-        // to prevent duplicates. Shared columns are intentionally NOT skipped
-        // — this method is where they are produced. The database-level
-        // <launchsettings> block is likewise NOT skipped: this is the one
-        // category that keeps it (written once to other/LaunchSettings.dxl).
+        // were already written to shared/ by exportForms(), so skip them here to
+        // prevent duplicates. Shared columns are intentionally NOT skipped — this
+        // method is where they are produced. <launchsettings> IS now skipped here
+        // (unlike before): it's written explicitly above via buildDatabaseSettingsDxl()
+        // regardless of whether Domino included it as a design element, so letting it
+        // through the generic per-element loop too would only risk a conflicting
+        // second write when Domino does include it.
         Set<String> skipTypes = new HashSet<>();
         skipTypes.add("subform");
         skipTypes.add("sharedfield");
+        skipTypes.add("launchsettings");
 
         exportCollection(nc, dir, /* skipJava= */ true, routes, skipTypes);
         nc.recycle();
@@ -416,7 +448,12 @@ public class DesignExporter {
         for (DxlProcessor.DesignElement element : elements) {
             if (!"acl".equalsIgnoreCase(element.getType())) {
                 // <launchsettings> rides along in every export wrapper; it is
-                // expected here (and owned by exportOther), so skip it quietly.
+                // expected here (and owned by exportOther as other/DatabaseSettings.dxl),
+                // so skip it quietly. Note: acl.dxl's own <database> wrapper never carries
+                // the portable settings attributes either way (DxlProcessor strips them
+                // from every file except DatabaseSettings.dxl) — this skip is purely about
+                // the stray <launchsettings> design element DxlExporter includes in every
+                // NoteCollection-scoped export, not about those attributes.
                 if (!"launchsettings".equalsIgnoreCase(element.getType())) {
                     System.out.println("  [SKIP unexpected " + element.getType()
                             + "] in ACL export");

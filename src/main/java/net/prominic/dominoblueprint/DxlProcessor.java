@@ -45,6 +45,9 @@ import java.util.Set;
  *             stamp, not source design content</li>
  *         <li>Empty {@code <code event="declarations"><lotusscript/></code>} blocks
  *             — Domino does not re-emit an empty declarations event on import</li>
+ *         <li>Portable database-settings attributes ({@link #DATABASE_SETTINGS_ATTRS}) on
+ *             every file except the {@code <launchsettings>} element's, so they exist in
+ *             exactly one exported file instead of duplicated everywhere</li>
  *       </ul>
  *   </li>
  *   <li><b>Detect Java</b> – an element is flagged as Java code when its own tag
@@ -85,6 +88,39 @@ public class DxlProcessor {
     private static final Set<String> DATABASE_ATTRS_TO_REMOVE = new HashSet<>(Arrays.asList(
             "replicaid", "path", "title"
     ));
+
+    /**
+     * Portable {@code <database>} attributes that represent real Advanced/Design/Basics
+     * tab settings (as opposed to source-replica identity): {@code categories},
+     * {@code defaultlanguage}, {@code fromtemplate}, {@code maintainunread},
+     * {@code maxrevisionentries}, {@code softdeletionsexpirein}, {@code allowsoftdeletion},
+     * {@code compressdesign}, {@code compressdata}, {@code uselz1}, {@code increasemaxfields}.
+     *
+     * <p>{@code buildCleanDxl()} used to copy these onto every exported file's
+     * {@code <database>} wrapper, which round-trips correctly (confirmed empirically,
+     * see {@code DominoBlueprint_RoundTrip_Status.md} item B) but duplicates the same
+     * values across all ~40 files for no reason — only files with
+     * {@code setReplaceDbProperties(true)} on import ever act on them.
+     *
+     * <p>As of 2026-07-02 these attributes are kept on exactly one file: the
+     * {@code <launchsettings>} element's wrapper, exported as
+     * {@code other/DatabaseSettings.dxl} (see {@link #TYPE_SUFFIXES}). Every other
+     * file, <b>including {@code acl/acl.dxl}</b>, has them stripped like an identity
+     * attribute. {@code acl.dxl} still needs {@code setReplaceDbProperties(true)} on import for
+     * its own {@code maxinternetaccess}/{@code adminserver} attributes (which live on
+     * {@code <acl>}, not {@code <database>}) — that is unaffected by stripping these here.
+     */
+    private static final Set<String> DATABASE_SETTINGS_ATTRS = new HashSet<>(Arrays.asList(
+            "categories", "defaultlanguage", "fromtemplate", "maintainunread",
+            "maxrevisionentries", "softdeletionsexpirein", "allowsoftdeletion",
+            "compressdesign", "compressdata", "uselz1", "increasemaxfields"
+    ));
+
+    /**
+     * Tag name of the one design element whose wrapper is allowed to keep
+     * {@link #DATABASE_SETTINGS_ATTRS}. See {@link #buildCleanDxl}.
+     */
+    private static final String DATABASE_SETTINGS_CARRIER_TAG = "launchsettings";
 
     /**
      * Top-level children of {@code <database>} that are never treated as design
@@ -197,7 +233,7 @@ public class DxlProcessor {
                 put("dataconnectionresource", "DataConnection");
                 put("replicationformula",     "ReplicationFormula");
                 put("databaseprofile",        "Profile");
-                put("launchsettings",         "LaunchSettings");
+                put("launchsettings",         "DatabaseSettings");
                 // Generic <note class="X"> values that DxlExporter uses instead of
                 // dedicated tags for certain element kinds
                 put("icon",                   "DatabaseIcon");
@@ -247,7 +283,17 @@ public class DxlProcessor {
             String  type     = resolveType(el);
             String  name     = resolveName(el);
             boolean isJava   = isJavaElement(el);
-            boolean isGhost  = isGhostElement(el);
+            // isGhostElement() falls through to `true` for an element with zero
+            // attributes and zero child elements (a legitimate soft-deleted stub for
+            // most note types). The <launchsettings> carrier element is the one
+            // exception: a fully-default Launch tab (no <weblaunch>/<noteslaunch>
+            // customisation) is exported by Domino as a bare <launchsettings/> with no
+            // attributes or children, which is real, meaningful design state — not a
+            // deletion stub — and now the sole carrier of DATABASE_SETTINGS_ATTRS (see
+            // buildCleanDxl). Ghost-skipping it would silently drop those 11 attributes
+            // from the entire export whenever Launch settings are left at defaults.
+            boolean isGhost  = DATABASE_SETTINGS_CARRIER_TAG.equals(type)
+                    ? false : isGhostElement(el);
             String  excluded = resolveExclusion(type, name);
             String  language = resolveLanguage(el, type, isJava);
             String  cleanDxl = buildCleanDxl(database, el);
@@ -368,6 +414,11 @@ public class DxlProcessor {
      * <p>Creates a fresh {@code <database>} wrapper copied from {@code origDatabase}
      * (minus the excluded attributes), imports and cleans the design element, then
      * serialises everything back to XML.
+     *
+     * <p>{@link #DATABASE_SETTINGS_ATTRS} are copied only when {@code designEl} is the
+     * {@link #DATABASE_SETTINGS_CARRIER_TAG} element (i.e. {@code <launchsettings>}) —
+     * every other file, ACL included, gets them stripped like a source-identity
+     * attribute, so the portable database settings live in exactly one output file.
      */
     private static String buildCleanDxl(Element origDatabase, Element designEl)
             throws Exception {
@@ -376,18 +427,23 @@ public class DxlProcessor {
         DocumentBuilder        db  = dbf.newDocumentBuilder();
         Document               newDoc = db.newDocument();
 
+        boolean keepSettingsAttrs =
+                DATABASE_SETTINGS_CARRIER_TAG.equals(localName(designEl));
+
         // --- Clean <database> wrapper -------------------------------------------
         Element newDatabase = newDoc.createElementNS(
                 origDatabase.getNamespaceURI(),
                 origDatabase.getTagName()
         );
 
-        // Copy attributes, skipping the source-replica-specific ones
+        // Copy attributes, skipping source-identity attrs always, and skipping the
+        // portable settings attrs unless this is the one file that carries them.
         NamedNodeMap attrs = origDatabase.getAttributes();
         for (int i = 0; i < attrs.getLength(); i++) {
             Attr attr = (Attr) attrs.item(i);
             String attrLocal = attr.getLocalName() != null ? attr.getLocalName() : attr.getName();
             if (DATABASE_ATTRS_TO_REMOVE.contains(attrLocal)) continue;
+            if (!keepSettingsAttrs && DATABASE_SETTINGS_ATTRS.contains(attrLocal)) continue;
 
             if (attr.getNamespaceURI() != null) {
                 newDatabase.setAttributeNS(
@@ -405,6 +461,91 @@ public class DxlProcessor {
         newDatabase.appendChild(importedEl);
 
         // --- Serialise ----------------------------------------------------------
+        return serialise(newDoc);
+    }
+
+    /**
+     * Build the standalone {@code other/DatabaseSettings.dxl} content directly from a
+     * category's raw DXL, <b>independent of whether {@link #splitElements()} would
+     * surface a {@code <launchsettings>} design element for it.</b>
+     *
+     * <p>Confirmed empirically 2026-07-13 (`TestDominoBlueprintExporter-v3.nsf`, Launch tab
+     * left at full Domino defaults): {@code DxlExporter.exportDxl(NoteCollection)} does
+     * <b>not</b> always emit a {@code <launchsettings>} child of {@code <database>} the way
+     * earlier testing against a different database (with a customised Launch tab) suggested
+     * &mdash; it appears to depend on the Launch tab having some non-default configuration.
+     * When absent, there was no design element left to carry {@link #DATABASE_SETTINGS_ATTRS}
+     * at all, silently dropping all 11 attributes from the export (a second bug beyond the
+     * {@code isGhostElement} fallthrough fixed earlier the same day). See item B in
+     * {@code DominoBlueprint_RoundTrip_Status.md}.
+     *
+     * <p>This method sidesteps that entirely: it parses the raw DXL, copies the identity-
+     * stripped {@code <database>} attributes (keeping {@link #DATABASE_SETTINGS_ATTRS}
+     * unconditionally, since this file is always their sole carrier), and embeds whatever
+     * {@code <launchsettings>} child actually exists &mdash; or a synthesised empty
+     * {@code <launchsettings/>} placeholder when Domino omitted it, so the file's shape and
+     * the importer's {@code fileDeclaresDbProperties()} substring match stay consistent
+     * either way.
+     *
+     * @param rawDxl Raw DXL for the same category/{@code NoteCollection} that
+     *               {@code other/} is otherwise built from (i.e. {@code exportOther()}'s).
+     * @return Clean DXL string for {@code other/DatabaseSettings.dxl}.
+     * @throws Exception on XML parse / transform errors
+     */
+    public static String buildDatabaseSettingsDxl(String rawDxl) throws Exception {
+        Document doc      = parseDxl(rawDxl);
+        Element  database = doc.getDocumentElement();
+
+        Element launchSettings = null;
+        NodeList children = database.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node child = children.item(i);
+            if (child.getNodeType() != Node.ELEMENT_NODE) continue;
+            if (DATABASE_SETTINGS_CARRIER_TAG.equals(localName((Element) child))) {
+                launchSettings = (Element) child;
+                break;
+            }
+        }
+
+        DocumentBuilderFactory dbf    = DocumentBuilderFactory.newInstance();
+        DocumentBuilder        db     = dbf.newDocumentBuilder();
+        Document               newDoc = db.newDocument();
+
+        Element newDatabase = newDoc.createElementNS(
+                database.getNamespaceURI(),
+                database.getTagName()
+        );
+
+        // Copy every attribute except source-identity ones. Unlike buildCleanDxl(), the
+        // settings attrs are ALWAYS kept here — this file is their one carrier.
+        NamedNodeMap attrs = database.getAttributes();
+        for (int i = 0; i < attrs.getLength(); i++) {
+            Attr attr = (Attr) attrs.item(i);
+            String attrLocal = attr.getLocalName() != null ? attr.getLocalName() : attr.getName();
+            if (DATABASE_ATTRS_TO_REMOVE.contains(attrLocal)) continue;
+
+            if (attr.getNamespaceURI() != null) {
+                newDatabase.setAttributeNS(
+                        attr.getNamespaceURI(), attr.getName(), attr.getValue());
+            } else {
+                newDatabase.setAttribute(attr.getName(), attr.getValue());
+            }
+        }
+
+        newDoc.appendChild(newDatabase);
+
+        if (launchSettings != null) {
+            Node imported = newDoc.importNode(launchSettings, /* deep= */ true);
+            cleanNoteMetadata((Element) imported);
+            newDatabase.appendChild(imported);
+        } else {
+            // Domino omitted <launchsettings> entirely (fully-default Launch tab) —
+            // synthesise an empty placeholder so the file is still self-describing and
+            // still matches DXLImport's fileDeclaresDbProperties() substring check.
+            newDatabase.appendChild(
+                    newDoc.createElementNS(database.getNamespaceURI(), "launchsettings"));
+        }
+
         return serialise(newDoc);
     }
 
