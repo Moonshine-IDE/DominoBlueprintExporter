@@ -99,6 +99,7 @@ public class DominoBlueprint {
         boolean passwordFromFlag = false;
         boolean passwordFromEnv  = false;
         int     aclImportOption  = DominoBlueprintImport.DEFAULT_ACL_IMPORT_OPTION;  // import only
+        boolean failOnCompileError = false;                                          // import only
 
         // PASSWORD env var first (lowest priority – the flag can override)
         String envPassword = System.getenv("PASSWORD");
@@ -146,6 +147,10 @@ public class DominoBlueprint {
                         System.err.println("ERROR: " + ex.getMessage());
                         System.exit(1);
                     }
+                    break;
+                case "--fail-on-compile-error":
+                    if (!"import".equals(command)) { unsupportedFlag(arg, command); }
+                    failOnCompileError = true;
                     break;
                 case "-p":
                 case "--password":
@@ -213,7 +218,7 @@ public class DominoBlueprint {
             } else if ("createdb".equals(command)) {
                 CreateDatabase.createDatabase(session, server, database);
             } else { // import
-                runImport(session, server, database, input, aclImportOption);
+                runImport(session, server, database, input, aclImportOption, failOnCompileError);
             }
         } catch (Throwable t) {
             System.err.println("Fatal error: " + t.getMessage());
@@ -236,14 +241,14 @@ public class DominoBlueprint {
     // -----------------------------------------------------------------------
 
     private static void runImport(Session session, String server, String database,
-                                  String input, int aclImportOption) throws Exception {
+                                  String input, int aclImportOption, boolean failOnCompileError) throws Exception {
         File source = new File(input);
         if (!source.exists()) {
             throw new Exception("Import source not found at: '" + source.getAbsolutePath() + "'.");
         }
         System.out.println("ACL import option: " + DominoBlueprintImport.aclImportOptionName(aclImportOption));
         if (source.isDirectory()) {
-            DominoBlueprintImport.importDXLDirectory(session, server, database, source, aclImportOption);
+            DominoBlueprintImport.importDXLDirectory(session, server, database, source, aclImportOption, failOnCompileError);
         } else {
             DominoBlueprintImport.importDXL(session, server, database, source, aclImportOption);
         }

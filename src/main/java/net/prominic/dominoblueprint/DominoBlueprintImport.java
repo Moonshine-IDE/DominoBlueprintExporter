@@ -3,7 +3,9 @@ package net.prominic.dominoblueprint;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import lotus.domino.*;
 
@@ -131,8 +133,19 @@ public class DominoBlueprintImport {
      */
     public static void importDXL(Session session, Database database, File dxlFile,
                                  int aclImportOption) throws NotesException, Exception {
+        importDXLTracked(session, database, dxlFile, aclImportOption);
+    }
+
+    /**
+     * As {@link #importDXL(Session, Database, File, int)}, but returns whether DxlImporter
+     * reported a code-compile failure (HCL log id {@code 7005}) for this file. Used by
+     * {@link #importDXLDirectory} to drive the dependency-ordered re-import passes.
+     */
+    static boolean importDXLTracked(Session session, Database database, File dxlFile,
+                                    int aclImportOption) throws NotesException, Exception {
         Stream stream = null;
         DxlImporter importer = null;
+        boolean hadCompileError = false;
 
         try {
             // https://help.hcl-software.com/dom_designer/14.0.0/basic/H_IMPORTDXL_METHOD_IMPORTER_JAVA.html
@@ -170,7 +183,7 @@ public class DominoBlueprintImport {
                 // A code-compile failure is reported by DxlImporter as a *log warning*
                 // (HCL log id 7005), not as a thrown NotesException: the design note is still
                 // created and counted as imported, so it would otherwise pass silently.
-                warnIfCompileErrors(dxlFile, importLog);
+                hadCompileError = warnIfCompileErrors(dxlFile, importLog);
             }
         }
         finally {
@@ -181,6 +194,7 @@ public class DominoBlueprintImport {
                 importer.recycle();
             }
         }
+        return hadCompileError;
     }
 
     // -----------------------------------------------------------------------
@@ -220,18 +234,74 @@ public class DominoBlueprintImport {
      */
     public static void importDXLDirectory(Session session, String server, String databaseName, File dxlDir,
                                           int aclImportOption) throws NotesException, Exception {
+        importDXLDirectory(session, server, databaseName, dxlDir, aclImportOption, false);
+    }
+
+    /**
+     * Extra dependency-ordered re-import passes after the first, used to resolve residual
+     * compile failures (e.g. a LotusScript {@code Use} chain the exporter didn't fully order,
+     * or the {@code .jar} build-path gap). Bounded so a genuinely broken element cannot loop.
+     */
+    private static final int MAX_EXTRA_COMPILE_PASSES = 5;
+
+    /**
+     * Dependency-aware directory import.
+     *
+     * <p>Files are imported in two phases (see {@link ImportOrdering} and
+     * {@code DominoBlueprint_Java_Dependency_Ordering.md}):</p>
+     * <ol>
+     *   <li><b>Phase 1</b> &mdash; every non-compiled element (forms, views, pages, subforms,
+     *       resources incl. {@code .jar}s, imported/pre-compiled Java, JavaScript/SSJS,
+     *       formula/simple agents, ACL, db properties), in stable alphabetical order with the
+     *       db-property-bearing files ({@code acl.dxl}, {@code other/DatabaseSettings.dxl})
+     *       moved last (see {@link #orderDbPropertyFilesLast}). Imported first so referenced
+     *       resources and design notes already exist before any code compiles.</li>
+     *   <li><b>Phase 2</b> &mdash; source Java agents/libraries (deps from
+     *       {@code <sharedlibraryref>}) and LotusScript agents/libraries (deps from
+     *       {@code Use "lib"}), topologically sorted so a library imports before everything
+     *       that references it.</li>
+     * </ol>
+     *
+     * <p>After the ordered pass, any element that still reported a compile failure is
+     * re-imported (up to {@link #MAX_EXTRA_COMPILE_PASSES} extra passes) until no further
+     * progress is made &mdash; each pass recompiles under {@code REPLACE_ELSE_CREATE}. Elements
+     * that never compile are counted separately ("Imported-with-compile-errors") so a broken
+     * element cannot hide inside {@code Failed: 0}; ordering cannot fix the exporter/environment
+     * fidelity gaps (jar build path, {@code lotus.domino} on the agent compile path), so this is
+     * a warning by default and only a hard failure when {@code failOnCompileError} is set.</p>
+     *
+     * @param failOnCompileError when {@code true}, a non-empty compile-error set after the final
+     *                           pass throws (non-zero exit). Default is {@code false} to preserve
+     *                           historical behaviour, since some compile failures are known
+     *                           environment gaps rather than ordering problems.
+     */
+    public static void importDXLDirectory(Session session, String server, String databaseName, File dxlDir,
+                                          int aclImportOption, boolean failOnCompileError) throws NotesException, Exception {
         if (null == dxlDir || !dxlDir.isDirectory()) {
             throw new Exception("DXL directory not found or not a directory: '" + (null == dxlDir ? "null" : dxlDir.getAbsolutePath()) + "'.");
         }
 
         List<File> dxlFiles = new ArrayList<File>();
         collectDXLFiles(dxlDir, dxlFiles);
-        // sort by absolute path for reproducible import order, then guarantee the
-        // db-property-bearing files (acl.dxl, DatabaseSettings.dxl) import last
-        Collections.sort(dxlFiles);
-        dxlFiles = orderDbPropertyFilesLast(dxlFiles);
+        Collections.sort(dxlFiles);   // stable alphabetical base order
+
+        // Split into (1) non-compiled elements and (2) compiled code in dependency order.
+        ImportOrdering.Plan plan = ImportOrdering.split(dxlFiles);
+        // Within phase 1, keep the db-property-bearing files (acl.dxl, DatabaseSettings.dxl) last.
+        List<File> phase1 = orderDbPropertyFilesLast(plan.phase1NonCompiled);
+        List<File> phase2 = plan.phase2Compiled;
 
         System.out.println("Found " + dxlFiles.size() + " DXL file(s) under '" + dxlDir.getAbsolutePath() + "'.");
+        System.out.println("  Phase 1 (non-compiled, imported first)     : " + phase1.size() + " file(s).");
+        System.out.println("  Phase 2 (compiled code, dependency-ordered): " + phase2.size() + " file(s).");
+        if (!plan.missingRefs.isEmpty()) {
+            System.out.println("  [NOTE] code references not present as elements in this blueprint "
+                + "(e.g. .jar build-path entries or platform LSX, which cannot be ordered): " + plan.missingRefs);
+        }
+        if (!plan.cycleNodes.isEmpty()) {
+            System.out.println("  [WARNING] dependency cycle detected among: " + plan.cycleNodes
+                + " -- these were appended in alphabetical order and may not compile cleanly.");
+        }
         if (dxlFiles.isEmpty()) {
             return;
         }
@@ -239,23 +309,71 @@ public class DominoBlueprintImport {
         Database database = null;
         int successCount = 0;
         List<String> failures = new ArrayList<String>();
+        Set<File> compileFailed = new LinkedHashSet<File>();
         try {
             database = session.getDatabase(server, databaseName, false);
             if (null == database || !database.isOpen()) {
                 throw new Exception("Could not open database '" + databaseName + "'.");
             }
 
-            for (File file : dxlFiles) {
-                System.out.println("--- Importing '" + file.getAbsolutePath() + "' ---");
+            // ---- Phase 1: non-compiled elements ----
+            for (File file : phase1) {
+                System.out.println("--- [phase 1] Importing '" + file.getAbsolutePath() + "' ---");
                 try {
                     importDXL(session, database, file, aclImportOption);
                     successCount++;
                 }
                 catch (Exception ex) {
-                    // Continue past a single bad file so one failure doesn't abort the entire import.
                     System.err.println("Failed to import '" + file.getAbsolutePath() + "': " + ex.getMessage());
                     ex.printStackTrace();
                     failures.add(file.getAbsolutePath());
+                }
+            }
+
+            // ---- Phase 2: compiled code, dependency order ----
+            for (File file : phase2) {
+                System.out.println("--- [phase 2] Importing '" + file.getAbsolutePath() + "' ---");
+                try {
+                    boolean hadCompileError = importDXLTracked(session, database, file, aclImportOption);
+                    successCount++;
+                    if (hadCompileError) {
+                        compileFailed.add(file);
+                    }
+                }
+                catch (Exception ex) {
+                    System.err.println("Failed to import '" + file.getAbsolutePath() + "': " + ex.getMessage());
+                    ex.printStackTrace();
+                    failures.add(file.getAbsolutePath());
+                }
+            }
+
+            // ---- Fallback: extra dependency-ordered passes to a fixpoint ----
+            int pass = 0;
+            while (!compileFailed.isEmpty() && pass < MAX_EXTRA_COMPILE_PASSES) {
+                pass++;
+                int before = compileFailed.size();
+                System.out.println("--- Re-import pass " + pass + " for " + before
+                    + " element(s) that have not compiled yet ---");
+                Set<File> stillFailing = new LinkedHashSet<File>();
+                for (File file : phase2) {                 // preserve dependency order
+                    if (!compileFailed.contains(file)) {
+                        continue;
+                    }
+                    System.out.println("--- [pass " + pass + "] Re-importing '" + file.getAbsolutePath() + "' ---");
+                    try {
+                        boolean hadCompileError = importDXLTracked(session, database, file, aclImportOption);
+                        if (hadCompileError) {
+                            stillFailing.add(file);
+                        }
+                    }
+                    catch (Exception ex) {
+                        System.err.println("Failed to re-import '" + file.getAbsolutePath() + "': " + ex.getMessage());
+                        stillFailing.add(file);
+                    }
+                }
+                compileFailed = stillFailing;
+                if (compileFailed.size() >= before) {
+                    break;   // no progress -- further passes will not help
                 }
             }
         }
@@ -265,7 +383,47 @@ public class DominoBlueprintImport {
             }
         }
 
-        System.out.println("Directory import complete.  Imported: " + successCount + ", Failed: " + failures.size() + ".");
+        System.out.println("Directory import complete.  Imported: " + successCount
+            + ", Failed: " + failures.size()
+            + ", Imported-with-compile-errors: " + compileFailed.size() + ".");
+        // ------------------------------------------------------------------
+        // CLASSPATH INVESTIGATION (2026-07-14) — why compiled Java still fails.
+        //
+        // On a Domino *server*, DxlImporter compiles Java agents/libraries at import
+        // time with a javac it spawns into a temp dir (/tmp/notes.../jar....dir/), and
+        // every such element fails with "package lotus.domino does not exist" — i.e.
+        // Notes.jar is not on that javac's classpath. Ordering does NOT cause this and
+        // cannot fix it (all Java fails identically regardless of dependency position;
+        // LotusScript compiles fine). What we tried, all with NO effect on the compile:
+        //   - notes.ini JavaUserClasses + JavaUserClassesExt = .../ndext/Notes.jar,
+        //     in BOTH the runtime-dir notes.ini (confirmed the one in effect) and
+        //     /local/notesdata/notes.ini. Confirmed Notes.jar exists and contains
+        //     lotus/domino/Session.class.
+        //   - Rewriting the <javaproject codepath="..."> from the authoring-machine
+        //     Windows path to the Linux program dir.
+        // Conclusion: the import-time compile appears to use only the note's own stored
+        // build path, not the server/notes.ini classpath, and there is no supported
+        // server-side knob to feed it the Domino API (HCL expects a Designer-class
+        // environment for Java-agent compilation). Decision: the generic tool DEFERS
+        // Java to the dedicated pre-build/import path (the "DXL Importer" Gradle build
+        // that compiles first and imports precompiled), rather than compiling at import.
+        // A "--skip-java" option (skip the source-Java flavour subdirs) is the planned
+        // clean follow-up. Full detail: DominoBlueprint_Java_Dependency_Ordering.md and
+        // DominoBlueprint_RoundTrip_Status.md items C/D.
+        // ------------------------------------------------------------------
+        if (!compileFailed.isEmpty()) {
+            StringBuilder cb = new StringBuilder();
+            cb.append(compileFailed.size())
+              .append(" element(s) imported but did NOT compile after all dependency-ordered passes:");
+            for (File f : compileFailed) {
+                cb.append("\n  - ").append(f.getAbsolutePath());
+            }
+            cb.append("\n  (Usually the exporter/environment fidelity gaps in ")
+              .append("DominoBlueprint_Java_Dependency_Ordering.md: a .jar build-path entry not encoded in ")
+              .append("the DXL, or the Domino API / Notes.jar not on the agent compile path. Recompile in ")
+              .append("Designer or fix the build path to clear them.)");
+            System.out.println(cb.toString());
+        }
         if (!failures.isEmpty()) {
             StringBuilder sb = new StringBuilder();
             sb.append(failures.size()).append(" DXL file(s) failed to import:");
@@ -273,6 +431,10 @@ public class DominoBlueprintImport {
                 sb.append("\n  - ").append(path);
             }
             throw new Exception(sb.toString());
+        }
+        if (failOnCompileError && !compileFailed.isEmpty()) {
+            throw new Exception(compileFailed.size()
+                + " element(s) imported but did not compile (--fail-on-compile-error was set).");
         }
     }
 
