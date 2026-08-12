@@ -1,5 +1,6 @@
 package net.prominic.dominoblueprint;
 
+import lotus.domino.ACL;
 import lotus.domino.Database;
 import lotus.domino.DxlExporter;
 import lotus.domino.NoteCollection;
@@ -103,6 +104,20 @@ public class DesignExporter {
     private final File outputDir;
 
     /**
+     * Running total of design notes seen across all category passes (every
+     * element parsed out of a {@link NoteCollection} export, including ones that
+     * are later skipped as Java/ghost/excluded). Used only for the end-of-run
+     * access diagnostic: a total of zero — with the ACL and DatabaseSettings
+     * still exporting fine — is the tell-tale signature of an ID that can open
+     * the database but lacks the access needed to enumerate its design.
+     *
+     * <p>Deliberately excludes the ACL and {@code other/DatabaseSettings.dxl}
+     * passes, which export even at low access and so must not mask a design-read
+     * problem.</p>
+     */
+    private int designElementsFound = 0;
+
+    /**
      * The database-level {@code <launchsettings>} block (Notes/Web launch
      * options) rides along in the {@code <database>} wrapper of EVERY
      * category's DXL export. It is legitimate design, but must be written
@@ -139,6 +154,17 @@ public class DesignExporter {
      * {@code shared/columns/} for reusable design elements.
      */
     public void exportAll() throws Exception {
+        // Effective access of the running ID for THIS database, resolved by
+        // Domino including group membership. Captured up front so it can be
+        // reported in the header and used for the end-of-run diagnostic.
+        int    accessLevel     = db.getCurrentAccessLevel();
+        String accessLevelName = accessLevelName(accessLevel);
+        String runningUser     = effectiveUserName();
+
+        System.out.println("Access level     : " + accessLevelName
+                + "  (effective, includes group membership)");
+        System.out.println();
+
         exportForms();
         exportViews();
         exportCode();
@@ -146,6 +172,8 @@ public class DesignExporter {
         exportPages();
         exportOther();
         exportACL();
+
+        printAccessDiagnostics(accessLevel, accessLevelName, runningUser);
     }
 
     /**
@@ -564,6 +592,7 @@ public class DesignExporter {
         List<DxlProcessor.DesignElement> elements = processor.splitElements();
 
         System.out.println("Found " + elements.size() + " design element(s).");
+        designElementsFound += elements.size();
 
         if (elements.isEmpty()) {
             System.out.println();
@@ -667,6 +696,138 @@ public class DesignExporter {
         if (skippedOther > 0) summary.append(", skipped (other): ").append(skippedOther);
         System.out.println(summary);
         System.out.println();
+    }
+
+    /**
+     * End-of-run access diagnostic.
+     *
+     * <p>Prints nothing on a healthy export (design was found and the running ID
+     * has Designer access or better). Otherwise it explains, in terms of the
+     * running ID's <em>effective</em> access, why the result may be incomplete —
+     * and, when access is the likely cause, prints a ready-to-apply ACL fix.</p>
+     *
+     * <p>This is always advisory, never fatal: the export of whatever WAS
+     * readable still succeeded, and effective access already accounts for group
+     * membership, so there is no need to second-guess the ACL by name.</p>
+     *
+     * @param level     the {@code ACL.LEVEL_*} value from {@code getCurrentAccessLevel()}
+     * @param levelName human-readable name for {@code level}
+     * @param user      the effective user name the export ran as
+     */
+    private void printAccessDiagnostics(int level, String levelName, String user) {
+        boolean anyDesign  = designElementsFound > 0;
+        boolean sufficient = level >= ACL.LEVEL_DESIGNER;
+
+        if (anyDesign && sufficient) {
+            return;   // healthy export — stay quiet
+        }
+
+        System.out.println();
+
+        if (!anyDesign) {
+            System.out.println("========================================================================");
+            System.out.println("WARNING: No design elements were exported.");
+            System.out.println("========================================================================");
+            System.out.println("  Only the ACL and database settings were written. That combination");
+            System.out.println("  almost always means the ID running the export cannot READ this");
+            System.out.println("  database's design — not that the design is missing.");
+            System.out.println();
+            System.out.println("  Running as   : " + user);
+            System.out.println("  Access level : " + levelName
+                    + "  (effective, includes group membership)");
+
+            if (level < ACL.LEVEL_READER) {
+                // No Access / Depositor: can open the DB and read ACL + settings,
+                // but cannot enumerate design. This is the usual culprit.
+                System.out.println();
+                System.out.println("  At " + levelName + " level you can open the database and read its");
+                System.out.println("  ACL and settings, but you CANNOT enumerate design notes. This is");
+                System.out.println("  almost certainly the cause.");
+                printAclFixSuggestion(user);
+            } else if (level < ACL.LEVEL_DESIGNER) {
+                // Reader/Author/Editor can normally read design; if none came out
+                // the DB may genuinely be data-only, but suggest a bump to be safe.
+                System.out.println();
+                System.out.println("  " + levelName + " access can normally read design. If design does");
+                System.out.println("  exist here, grant Designer (or Manager) to be certain nothing is");
+                System.out.println("  filtered out. Otherwise this may genuinely be a data-only or");
+                System.out.println("  design-stripped copy of the database.");
+                printAclFixSuggestion(user);
+            } else {
+                // Designer/Manager and still nothing: not an access problem.
+                System.out.println();
+                System.out.println("  Your access (" + levelName + ") is sufficient to read design, so");
+                System.out.println("  the database most likely has no exportable design. Verify you are");
+                System.out.println("  pointing at the correct copy/replica (not a data-only copy) and");
+                System.out.println("  that its design is not hidden.");
+            }
+            System.out.println("========================================================================");
+        } else {
+            // Design WAS found, but access is below Designer — light caution only.
+            System.out.println("------------------------------------------------------------------------");
+            System.out.println("NOTE: Export ran with " + levelName + " access (below Designer).");
+            System.out.println("  Design was exported, but a full round-trip normally wants Designer or");
+            System.out.println("  Manager access. If anything looks missing, re-run with a higher-access");
+            System.out.println("  ID. (Access is resolved including group membership, so this may be a");
+            System.out.println("  false alarm.)");
+            System.out.println("------------------------------------------------------------------------");
+        }
+        System.out.println();
+    }
+
+    /**
+     * Print concrete, copy-pasteable guidance for granting the running ID enough
+     * access to read design. Kept deliberately explicit — both the Notes-client
+     * steps and the equivalent {@code <aclentry>} — because this message is the
+     * one a user hits when an export mysteriously comes back empty.
+     */
+    private void printAclFixSuggestion(String user) {
+        System.out.println();
+        System.out.println("  To fix, grant this ID at least Designer access (Manager recommended for a");
+        System.out.println("  full round-trip). In the Notes client, on the database's server copy:");
+        System.out.println("    File > Application > Access Control > Add...");
+        System.out.println("      Person : " + user);
+        System.out.println("      Access : Manager   (or Designer)");
+        System.out.println();
+        System.out.println("  Equivalent entry as it would appear in acl/acl.dxl:");
+        System.out.println("    <aclentry level=\"manager\" name=\"" + user + "\"");
+        System.out.println("              deletedocs=\"true\" noreplicate=\"false\"/>");
+        System.out.println();
+        System.out.println("  Note: a group or wildcard entry (e.g. */O=ORG) may already grant access,");
+        System.out.println("  and a name-only entry can be shadowed by a lower-level group — the");
+        System.out.println("  effective level above already accounts for both.");
+    }
+
+    /**
+     * Map an {@code ACL.LEVEL_*} constant to its human-readable name.
+     */
+    private static String accessLevelName(int level) {
+        switch (level) {
+            case ACL.LEVEL_NOACCESS:  return "No Access";
+            case ACL.LEVEL_DEPOSITOR: return "Depositor";
+            case ACL.LEVEL_READER:    return "Reader";
+            case ACL.LEVEL_AUTHOR:    return "Author";
+            case ACL.LEVEL_EDITOR:    return "Editor";
+            case ACL.LEVEL_DESIGNER:  return "Designer";
+            case ACL.LEVEL_MANAGER:   return "Manager";
+            default:                  return "Unknown (level " + level + ")";
+        }
+    }
+
+    /**
+     * Best-effort effective user name for the running session, falling back to
+     * the ID owner and finally a placeholder so diagnostics never NPE.
+     */
+    private String effectiveUserName() {
+        try {
+            String n = session.getEffectiveUserName();
+            if (n != null && !n.isEmpty()) return n;
+        } catch (Exception ignore) { /* fall through */ }
+        try {
+            String n = session.getUserName();
+            if (n != null && !n.isEmpty()) return n;
+        } catch (Exception ignore) { /* fall through */ }
+        return "(current ID)";
     }
 
     /**
