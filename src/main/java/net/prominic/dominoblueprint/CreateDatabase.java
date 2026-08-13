@@ -25,18 +25,39 @@ import lotus.domino.Session;
 public class CreateDatabase {
 
     /**
+     * Create a blank database, deriving the title from the file name.
+     *
+     * <p>Equivalent to {@link #createDatabase(Session, String, String, String)}
+     * with a {@code null} title.</p>
+     */
+    public static void createDatabase(Session session, String server, String databaseName)
+            throws NotesException, Exception {
+        createDatabase(session, server, databaseName, null);
+    }
+
+    /**
      * Create a blank database on {@code server} at {@code databaseName}.
      *
      * <p>If the database already exists it is left untouched and the method
      * returns without printing the post-creation warning.  When a new database
-     * is created its title is derived from the file name and a minimal ACL is
-     * configured ({@code -Default-} = Manager, {@code Anonymous} = Editor).</p>
+     * is created a minimal ACL is configured ({@code -Default-} = Manager,
+     * {@code Anonymous} = Editor).</p>
+     *
+     * <p><b>Title.</b> When {@code title} is non-empty it becomes the database
+     * title; otherwise the title is derived from the file name (directory and
+     * extension stripped).  Note that a subsequent {@code import} of a blueprint
+     * re-imports the icon design note &mdash; whose {@code $TITLE} item carries
+     * the <em>source</em> database's title &mdash; and that import is the last
+     * writer, so a title set here is typically overwritten by an import.  Use
+     * {@code import --title} to set a title that survives an import.</p>
      *
      * @param session      an open Notes session (owned by the caller)
      * @param server       Domino server name; use {@code ""} for local
      * @param databaseName target database path, e.g. {@code apps/mydb.nsf}
+     * @param title        desired database title, or {@code null}/empty to derive
+     *                     it from the file name
      */
-    public static void createDatabase(Session session, String server, String databaseName)
+    public static void createDatabase(Session session, String server, String databaseName, String title)
             throws NotesException, Exception {
         DbDirectory dbDirectory = null;
         Database database = null;
@@ -74,21 +95,31 @@ public class CreateDatabase {
             // reminds the caller that the database will not open in the Notes
             // client until at least one view has been imported.
 
-            // For the title, use the database name, but strip the directory and extension
-            String title = databaseName;
-            int index = title.lastIndexOf('.');
-            if (index >= 0) {
-                title = title.substring(0, index);
+            // For the title: use the caller-supplied title when given, otherwise
+            // derive it from the database file name (strip the directory and
+            // extension).
+            //
+            // Caveat: a subsequent `import` re-imports the icon design note, whose
+            // $TITLE carries the SOURCE database's title, and that import is the
+            // last writer -- so a title set here is typically overwritten by an
+            // import.  Use `import --title` to set a title that survives an import.
+            String effectiveTitle = title;
+            if (effectiveTitle == null || effectiveTitle.isEmpty()) {
+                effectiveTitle = databaseName;
+                int index = effectiveTitle.lastIndexOf('.');
+                if (index >= 0) {
+                    effectiveTitle = effectiveTitle.substring(0, index);
+                }
+                index = effectiveTitle.lastIndexOf("/");
+                if (index < 0) { // no match
+                    index = effectiveTitle.lastIndexOf("\\");  // try backslash instead
+                }
+                if (index >= 0) {
+                    effectiveTitle = effectiveTitle.substring(index + 1);
+                }
             }
-            index = title.lastIndexOf("/");
-            if (index < 0) { // no match
-                index = title.lastIndexOf("\\");  // try backslash instead
-            }
-            if (index >= 0) {
-                title = title.substring(index + 1);
-            }
-            System.out.println("Setting title to '" + title + "'.");
-            database.setTitle(title);
+            System.out.println("Setting title to '" + effectiveTitle + "'.");
+            database.setTitle(effectiveTitle);
 
             // Update the ACL
             // Update default to allow user access from Notes or Designer

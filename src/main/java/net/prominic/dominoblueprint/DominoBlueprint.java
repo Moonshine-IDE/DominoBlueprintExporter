@@ -4,6 +4,7 @@ import java.io.Console;
 import java.io.File;
 import java.util.Arrays;
 
+import lotus.domino.Database;
 import lotus.domino.NotesFactory;
 import lotus.domino.NotesThread;
 import lotus.domino.Session;
@@ -39,6 +40,10 @@ import lotus.domino.Session;
  *   <li>{@code export}:  {@code -o, --output <dir>}   Output root directory (default {@code ./export})</li>
  *   <li>{@code import}:  {@code -i, --input <path>}   A {@code .dxl} file or a directory of them (required)</li>
  *   <li>{@code import}:  {@code --acl-import=<mode>}  How the DXL ACL is applied (default {@code update-else-create})</li>
+ *   <li>{@code createdb}:{@code  -t, --title <title>} Set the initial database title; optional. A later
+ *                                                     {@code import} usually overwrites it (see {@code import --title})</li>
+ *   <li>{@code import}:  {@code  -t, --title <title>} Set the database title after import; overrides the title
+ *                                                     carried by the imported icon design note (optional)</li>
  * </ul>
  *
  * <h3>Password resolution order</h3>
@@ -100,6 +105,7 @@ public class DominoBlueprint {
         boolean passwordFromEnv  = false;
         int     aclImportOption  = DominoBlueprintImport.DEFAULT_ACL_IMPORT_OPTION;  // import only
         boolean failOnCompileError = false;                                          // import only
+        String  title             = null;                                            // import + createdb
 
         // PASSWORD env var first (lowest priority – the flag can override)
         String envPassword = System.getenv("PASSWORD");
@@ -118,6 +124,11 @@ public class DominoBlueprint {
                     System.err.println("ERROR: " + ex.getMessage());
                     System.exit(1);
                 }
+                continue;
+            }
+            if (arg.startsWith("--title=")) {
+                if (!("import".equals(command) || "createdb".equals(command))) { unsupportedFlag(arg, command); }
+                title = arg.substring("--title=".length());
                 continue;
             }
             switch (arg) {
@@ -147,6 +158,11 @@ public class DominoBlueprint {
                         System.err.println("ERROR: " + ex.getMessage());
                         System.exit(1);
                     }
+                    break;
+                case "-t":
+                case "--title":
+                    if (!("import".equals(command) || "createdb".equals(command))) { unsupportedFlag(arg, command); }
+                    title = nextValue(args, ++i, arg);
                     break;
                 case "--fail-on-compile-error":
                     if (!"import".equals(command)) { unsupportedFlag(arg, command); }
@@ -216,9 +232,9 @@ public class DominoBlueprint {
             if ("export".equals(command)) {
                 DominoBlueprintExporter.export(session, server, database, outputDir);
             } else if ("createdb".equals(command)) {
-                CreateDatabase.createDatabase(session, server, database);
+                CreateDatabase.createDatabase(session, server, database, title);
             } else { // import
-                runImport(session, server, database, input, aclImportOption, failOnCompileError);
+                runImport(session, server, database, input, aclImportOption, failOnCompileError, title);
             }
         } catch (Throwable t) {
             System.err.println("Fatal error: " + t.getMessage());
@@ -241,7 +257,8 @@ public class DominoBlueprint {
     // -----------------------------------------------------------------------
 
     private static void runImport(Session session, String server, String database,
-                                  String input, int aclImportOption, boolean failOnCompileError) throws Exception {
+                                  String input, int aclImportOption, boolean failOnCompileError,
+                                  String title) throws Exception {
         File source = new File(input);
         if (!source.exists()) {
             throw new Exception("Import source not found at: '" + source.getAbsolutePath() + "'.");
@@ -251,6 +268,21 @@ public class DominoBlueprint {
             DominoBlueprintImport.importDXLDirectory(session, server, database, source, aclImportOption, failOnCompileError);
         } else {
             DominoBlueprintImport.importDXL(session, server, database, source, aclImportOption);
+        }
+
+        // Apply the database title LAST — after every design note has been imported,
+        // including the icon design note whose $TITLE item carries the SOURCE
+        // database's title. Because the icon import is the last thing to write the
+        // title, setting it here (rather than in createdb) is what makes a custom
+        // title stick. No-op when --title was not supplied.
+        if (title != null && !title.isEmpty()) {
+            Database db = session.getDatabase(server, database, false);
+            if (null == db || !db.isOpen()) {
+                throw new Exception("Could not open database to set title: '" + database + "'.");
+            }
+            System.out.println("Setting database title to '" + title + "'.");
+            db.setTitle(title);
+            db.recycle();
         }
     }
 
@@ -360,6 +392,13 @@ public class DominoBlueprint {
             System.out.println("Example:");
             System.out.println("  java -jar DominoBlueprint.jar export -d apps/mydb.nsf -o ./export");
         } else if ("createdb".equals(command)) {
+            System.out.println("createdb options:");
+            System.out.println("  -t, --title <title>        Initial database title.  Optional; if omitted the");
+            System.out.println("                             title is derived from the file name.  NOTE: a later");
+            System.out.println("                             'import' re-imports the icon note and usually");
+            System.out.println("                             overwrites this -- use 'import --title' for a title");
+            System.out.println("                             that survives an import.");
+            System.out.println();
             System.out.println("createdb creates a blank database with NO views.  Import a blueprint");
             System.out.println("(which supplies the views) before opening it in the Notes client.");
             System.out.println();
@@ -368,6 +407,8 @@ public class DominoBlueprint {
         } else { // import
             System.out.println("import options:");
             System.out.println("  -i, --input    <path>      A .dxl file or a directory of .dxl files (required)");
+            System.out.println("  -t, --title <title>        Set the database title after import.  Overrides the");
+            System.out.println("                             title carried by the imported icon note.  Optional.");
             System.out.println("  --acl-import=<mode>        How the DXL ACL is applied to the target.");
             System.out.println("                             Default: update-else-create.  Modes (case-insensitive):");
             System.out.println("                               ignore               – Skip ACL in DXL.");
@@ -382,6 +423,9 @@ public class DominoBlueprint {
             System.out.println("Examples:");
             System.out.println("  # Import a full blueprint tree (merges ACL, preserves target-only entries)");
             System.out.println("  java -jar DominoBlueprint.jar import -d apps/restored.nsf -i ./export");
+            System.out.println();
+            System.out.println("  # Import a tree and stamp a custom database title");
+            System.out.println("  java -jar DominoBlueprint.jar import -d apps/restored.nsf -i ./export --title \"My DB - build 42\"");
             System.out.println();
             System.out.println("  # Import a single DXL file, replacing the target ACL exactly");
             System.out.println("  java -jar DominoBlueprint.jar import -d apps/restored.nsf -i ./export/acl/acl.dxl --acl-import=replace");
